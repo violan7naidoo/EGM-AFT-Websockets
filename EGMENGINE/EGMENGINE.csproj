@@ -1,0 +1,71 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Remove="GUI\MenuGUIController.cs~RF2bdeb77a.TMP" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="GXGCoreAPIBridge">
+      <HintPath>LibDependencies\GXGCoreAPIBridge.dll</HintPath>
+    </Reference>
+    <Reference Include="GXGGFMAPIBridge">
+      <HintPath>LibDependencies\GXGGFMAPIBridge.dll</HintPath>
+    </Reference>
+    <Reference Include="ITLlib">
+      <HintPath>LibDependencies\ITLlib.dll</HintPath>
+    </Reference>
+    <Reference Include="SlotMathCore">
+      <HintPath>LibDependencies\SlotMathCore.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="EGMPlay\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Mono.Data.Sqlite" Version="1.0.61" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="System.IO.Hashing" Version="9.0.2" />
+    <PackageReference Include="websocketsharp.core" Version="1.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Assets\EGMEngineDB.db">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="GXGCoreAPI.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="GXGGFMAPI.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="GXGSASAPI.h">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="GXGCoreAPI.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="GXGSASAPI.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="GXGSASAPI.h">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="GXGSASAPI.lib">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="libusb-1.0.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="wdapi1250.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
