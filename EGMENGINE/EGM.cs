@@ -586,67 +586,75 @@ namespace EGMENGINE
                 {
                     Logger.Log($"Starting WebSocket spin process - Bet: {betAmount}, Win: {winAmount}");
 
-                    // Check if we're in a playable state (same as Windows Form check)
+
                     if (EGMStatus.GetInstance().frontend_play.thisstatus != FrontEndPlayStatus.Playable)
                     {
                         Logger.Log($"Cannot spin - wrong state: {EGMStatus.GetInstance().frontend_play.thisstatus}");
-                        return;
+                        if (EGMStatus.GetInstance().frontend_play.thisstatus == FrontEndPlayStatus.WinningState)
+                        {
+                            Logger.Log("Attempting to recover from stuck WinningState...");
+                            GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.WinAnimationFinished);
+                            Thread.Sleep(100);
+                            if (EGMStatus.GetInstance().frontend_play.thisstatus != FrontEndPlayStatus.Playable)
+                            {
+                                Logger.Log("Recovery failed, state is still not Playable.");
+                                _isProcessingSpin = false;
+                                return;
+                            }
+                            Logger.Log("Recovery successful, state is now Playable. Proceeding with spin.");
+                        }
+                        else
+                        {
+                            _isProcessingSpin = false;
+                            return;
+                        }
                     }
+                    // =========================================================================
 
-                    // Get credits before spin (same as Windows Form)
                     decimal creditsBefore = EGM_GetCurrentCredits();
                     Logger.Log($"Credits before spin: {creditsBefore}");
 
-                    // Store last state (same as Windows Form)
-                    var lastState = EGMStatus.GetInstance().frontend_play.thisstatus;
-
-                    // THIS IS THE KEY CALL - same as Windows Form
                     Logger.Log("Calling GUI_SpinButtonPressed...");
-
                     var spinConfig = GameGUIController.GetInstance().GUI_SpinButtonPressed(winAmount, betAmount);
-
-                    // Get current state after spin (same as Windows Form)
                     var currentState = GameGUIController.GetInstance().GUI_get_FrontEndPlayStatus();
                     Logger.Log($"State after GUI_SpinButtonPressed: {currentState}");
 
-                    // MANUALLY TRIGGER ANIMATIONS - same as Windows Form
                     Logger.Log("Triggering ReelsSpinning animation...");
                     GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.ReelsSpinning);
-
-                    // Wait a bit (simulating the Windows Form flow)
                     Thread.Sleep(500);
 
                     Logger.Log("Triggering ReelsStoped animation...");
                     GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.ReelsStoped);
 
-                    // Get the last play details (same as Windows Form)
+
+                    //prevents the state from getting stuck after a win.
+                    if (winAmount > 0)
+                    {
+                        Thread.Sleep(200);
+                        Logger.Log($"Win detected ({winAmount}). Triggering WinAnimationFinished to return to Playable state.");
+                        GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.WinAnimationFinished);
+                    }
+                    // ===============================================================================
+
                     spinConfig = GameGUIController.GetInstance().GUI_GetLastPlay();
                     Logger.Log($"Last play retrieved - CreditsBefore: {spinConfig.slotplay.creditsBefore}, CreditsOnPlay: {spinConfig.slotplay.creditsOnPlay}");
 
-                    // Get current credits directly from EGM (same as Windows Form)
                     decimal currentCredits = EGM_GetCurrentCredits();
                     Logger.Log($"Credits after spin: {currentCredits}");
-
-                    // Notify UI of credit changes (equivalent to updatecreditlabel)
                     CreditsUpdated?.Invoke(currentCredits);
 
-                    // Get final state (same as Windows Form)
                     currentState = GameGUIController.GetInstance().GUI_get_FrontEndPlayStatus();
-                    Logger.Log($"Final state: {currentState}");
+                    Logger.Log($"Final state after processing: {currentState}");
 
-                    // Wait for the full spin duration (same as Windows Form)
                     Logger.Log("Waiting for spin completion...");
                     Thread.Sleep(10000);
 
-                    // Send completion message back through WebSocket
                     SendSpinCompletionMessage(betAmount, winAmount, currentCredits);
-
-                    Logger.Log("WebSocket spin completed successfully - identical to Windows Form behavior");
+                    Logger.Log("WebSocket spin completed successfully.");
                 }
                 catch (Exception ex)
                 {
                     Logger.Log($"WebSocket spin failed: {ex.Message}");
-                    // Reset states on error (same recovery as Windows Form would do)
                     EGMStatus.GetInstance().frontend_play.Transition(FrontEndPlayStatus.Playable);
                     EGMStatus.GetInstance().spinstatus.Transition(SpinRepresentationStatus.Idle);
                 }
@@ -1120,9 +1128,9 @@ namespace EGMENGINE
                 // Convert for internal processing if cashout
                 if (t == "Cash Out")
                 {
-                    c = 1 * c;
-                    r = 1 * r;
-                    nr = 1 * nr;
+                    c = -1 * c;
+                    r = -1 * r;
+                    nr = -1 * nr;
                 }
                 // For both cashout AND cashin, store the data and wait for confirmation
                 _pendingTransferData = new AFTTransferData
@@ -1141,10 +1149,10 @@ namespace EGMENGINE
                 decimal totalAmount = c + r + nr;
                 decimal currentCredits = EGM_GetCurrentCredits();
                 bool isCashout = t == "Cash Out";
-                HandleTransferConfirmation(true);
+               
                 SendAFTWebSocket(Math.Abs(totalAmount), isCashout, currentCredits, dc.ToString());
                 Logger.Log($"WebSocket sent: Total amount : {totalAmount}, isCashout: {isCashout}, currentCredits {currentCredits}. Waiting for confirmation...");
-
+                HandleTransferConfirmation(true);
                 // Start retry timer
                 _websocketRetryTimer.Start();
 

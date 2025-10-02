@@ -1324,7 +1324,7 @@ namespace EGMENGINE.SASCTLModule
                              * amount first, then the nonrestricted amount, then the cashout amount, until the
                              * limit is reached.
                              */
-                            if (transferCode == 0)
+                            if (transferCode == 0)  // Logic for "Full Transfer ONLY"
                             {
                                 // Check the available amount for transfer
                                 qwCompCashAmount = (sasCashCredit > cashableAmount ? cashableAmount : sasCashCredit);
@@ -1356,9 +1356,13 @@ namespace EGMENGINE.SASCTLModule
                             }
                             else
                             {
-                                qwCompCashAmount = cashableAmount;
-                                qwCompResAmount = restrictedAmount;
-                                qwCompNonresAmount = nonRestrictedAmount;
+
+                                //qwCompCashAmount = cashableAmount;
+                                //qwCompResAmount = restrictedAmount;
+                                //qwCompNonresAmount = nonRestrictedAmount;
+                                qwCompCashAmount = (sasCashCredit > cashableAmount ? cashableAmount : sasCashCredit);
+                                qwCompResAmount = (sasRestCredit > restrictedAmount ? restrictedAmount : sasRestCredit);
+                                qwCompNonresAmount = (sasNonRestCredit > nonRestrictedAmount ? nonRestrictedAmount : sasNonRestCredit);
                             }
 
                             // Update current credit
@@ -1385,7 +1389,9 @@ namespace EGMENGINE.SASCTLModule
                         qwCompNonresAmount = 0;
                     }
 
-
+                   // qwCompCashAmount = 50000;
+                    //qwCompResAmount = 0;
+                    //qwCompNonresAmount = 0;
                     // Complete AFT transfer
                     client.FinishAFTTransfer(transferCode, qwCompCashAmount,
                                         qwCompResAmount,
