@@ -1,4 +1,4 @@
-﻿using EGMENGINE.BillAccCTLModule;
+using EGMENGINE.BillAccCTLModule;
 using EGMENGINE.BillAccCTLModule.BillAccTypes;
 using EGMENGINE.BillAccCTLModule.Impl.SSPBillAccCTL;
 using EGMENGINE.BillAccCTLModule.Impl.SSPBillAccServiceCTL;
@@ -334,7 +334,7 @@ namespace EGMENGINE
             /*************************************************************/
             /********************** WebSockets ******************************/
             /*************************************************************/
-            InitializeWebSocket("ws://192.168.128.180:5000/ws");
+            InitializeWebSocket("ws://localhost:5000/ws");
             TestWebSocketConnection();
 
             Logger.Log("EGM initialization completed");
@@ -459,11 +459,12 @@ namespace EGMENGINE
                     eventType = "CONNECTION_TEST",
                     message = "Initial connection test",
                     timestamp = DateTime.UtcNow,
-                    client = "EGM_Application"
+                    client = "EGM_Application",
+                    CurrentCredits = EGM_GetCurrentCredits()
                 };
 
                 SendToWebSocket(testMessage);
-                Logger.Log("Connection test message sent");
+                Logger.Log($"Connection test message sent (CurrentCredits: {EGM_GetCurrentCredits()})");
             }
             else
             {
@@ -1147,7 +1148,8 @@ namespace EGMENGINE
 
                 // Send websocket and wait for confirmation
                 decimal totalAmount = c + r + nr;
-                decimal currentCredits = EGM_GetCurrentCredits();
+                // Calculate future credits by adding the transfer amount to current credits
+                decimal currentCredits = EGM_GetCurrentCredits() + totalAmount;
                 bool isCashout = t == "Cash Out";
                
                 SendAFTWebSocket(Math.Abs(totalAmount), isCashout, currentCredits, dc.ToString());
@@ -1236,7 +1238,7 @@ namespace EGMENGINE
 
                 // Resend WebSocket
                 decimal totalAmount = _pendingTransferData.Cashable + _pendingTransferData.Restricted + _pendingTransferData.NonRestricted;
-                decimal currentCredits = EGM_GetCurrentCredits();
+                decimal currentCredits = EGM_GetCurrentCredits() + totalAmount; // Add totalAmount to get future credits
                 bool isCashout = _pendingTransferData.Type == "Cash Out";
 
                 SendAFTWebSocket(Math.Abs(totalAmount), isCashout, currentCredits, _pendingTransferData.DataCode.ToString());
@@ -1373,8 +1375,8 @@ namespace EGMENGINE
                 // Add Bill Insertion
                 AddSystemLog($"R {bill}.00 bill accepted", "-");
 
-                //decimal currentCredits = GetCurrentCredits();
-                //SendBillAcceptedToWebSocket(bill, currentCredits);
+                // Send websocket with correct current credits (after bill is added)
+                SendBillAcceptedToWebSocket(bill);
 
                 Logger.Log($"Bill accepted: {bill}");
 
@@ -1634,6 +1636,8 @@ namespace EGMENGINE
 
         public void SendBillAcceptedToWebSocket(decimal amount)
         {
+            // Credits already include the bill amount since AddAmount was called before this method
+            // So we just get the current credits without adding the amount again
             decimal credits = EGM_GetCurrentCredits();
             var message = new
             {

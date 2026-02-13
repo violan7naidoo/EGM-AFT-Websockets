@@ -376,16 +376,7 @@ namespace EGMENGINE.BillAccCTLModule.Impl.SSPBillAccServiceCTL
 
                                         Logger.Log($"Bill accepted: {denomObj.denom}");
 
-                                        // Call the WebSocket method
-                                        if (egmInstance != null)
-                                        {
-                                            Logger.Log("EGM instance found, calling SendBillAcceptedToWebSocket");
-                                            egmInstance.SendBillAcceptedToWebSocket(denomObj.denom);
-                                        }
-                                        else
-                                        {
-                                            Logger.Log("EGM instance is null");
-                                        }
+                                        // WebSocket is now sent from the event handler in EGM.cs to avoid duplicates
 
                                     }
                                     break;
