@@ -335,7 +335,7 @@ namespace EGMENGINE
             /********************** WebSockets ******************************/
             /*************************************************************/
             InitializeWebSocket("ws://localhost:5000/ws");
-            TestWebSocketConnection();
+            SendSessionInitialized();
 
             Logger.Log("EGM initialization completed");
 
@@ -447,28 +447,38 @@ namespace EGMENGINE
             //}
         }
 
-        public void TestWebSocketConnection()
+        /// <summary>
+        /// Sends session_initialized to the WebSocket server once per engine run to initialize the session with current credits.
+        /// </summary>
+        public void SendSessionInitialized()
         {
-            Logger.Log("=== Testing WebSocket Connection ===");
+            Logger.Log("=== Sending session_initialized to WebSocket ===");
             CheckWebSocketStatus();
+
+            if (_sessionInitializedSent)
+            {
+                Logger.Log("Session already initialized this run - skipping (sends only once until engine restart).");
+                return;
+            }
 
             if (webSocket?.IsAlive == true)
             {
-                var testMessage = new
+                decimal credits = EGM_GetCurrentCredits();
+                var message = new
                 {
-                    eventType = "CONNECTION_TEST",
-                    message = "Initial connection test",
-                    timestamp = DateTime.UtcNow,
+                    eventType = "session_initialized",
                     client = "EGM_Application",
-                    CurrentCredits = EGM_GetCurrentCredits()
+                    timestamp = DateTime.UtcNow,
+                    payload = new { availableCredits = credits }
                 };
 
-                SendToWebSocket(testMessage);
-                Logger.Log($"Connection test message sent (CurrentCredits: {EGM_GetCurrentCredits()})");
+                SendToWebSocket(message);
+                _sessionInitializedSent = true;
+                Logger.Log($"session_initialized sent once (availableCredits: {credits}). Will not send again until engine restarts.");
             }
             else
             {
-                Logger.Log("WebSocket not connected - cannot send test message");
+                Logger.Log("WebSocket not connected - cannot send session_initialized");
             }
         }
 
@@ -939,6 +949,7 @@ namespace EGMENGINE
         private AFTTransferData _pendingTransferData;
         private System.Timers.Timer _websocketRetryTimer;
         private bool _cardInserted = false;
+        private bool _sessionInitializedSent = false;
 
         //hold transfer data (for websocket to confirm)
         private class AFTTransferData
