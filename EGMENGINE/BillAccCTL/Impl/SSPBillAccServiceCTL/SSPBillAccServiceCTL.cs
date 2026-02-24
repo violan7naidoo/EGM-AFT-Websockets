@@ -376,7 +376,7 @@ namespace EGMENGINE.BillAccCTLModule.Impl.SSPBillAccServiceCTL
 
                                         Logger.Log($"Bill accepted: {denomObj.denom}");
 
-                                        // WebSocket is now sent from the event handler in EGM.cs to avoid duplicates
+                                        
 
                                     }
                                     break;

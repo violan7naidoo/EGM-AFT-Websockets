@@ -222,6 +222,14 @@ namespace EGMENGINE
         //Websocket connection status
         private bool isConnected = false;
         private WebSocketSharp.WebSocket webSocket;
+
+        private bool no_more_bets = false;
+
+        public bool GetNoMoreBets() => no_more_bets;
+        public void SetNoMoreBets(bool value) => no_more_bets = value;
+
+        bool aft_pending_no_more_bets = false;
+
         private readonly object spinLock = new object();
         private int currentBet = 0;  // Default values
         private int currentWin = 0;  // Default values
@@ -334,7 +342,7 @@ namespace EGMENGINE
             /*************************************************************/
             /********************** WebSockets ******************************/
             /*************************************************************/
-            InitializeWebSocket("ws://localhost:5000/ws");
+            InitializeWebSocket("ws://localhost:5000/ws/egm");
             SendSessionInitialized();
 
             Logger.Log("EGM initialization completed");
@@ -428,13 +436,13 @@ namespace EGMENGINE
 
             if (EGMStatus.GetInstance().frontend_play.thisstatus == FrontEndPlayStatus.Playable || EGMStatus.GetInstance().frontend_play.thisstatus == FrontEndPlayStatus.WaitingForBet || EGMStatus.GetInstance().frontend_play.thisstatus == FrontEndPlayStatus.WaitingForCredits)
             {
-                billAcc.EnableBillAcceptor();
-                SASCTL.GetInstance().AcceptTransfer(true, true);
+                //billAcc.EnableBillAcceptor();
+                //SASCTL.GetInstance().AcceptTransfer(true, true);
             }
             else
             {
-                billAcc.DisableBillAcceptor();
-                SASCTL.GetInstance().RejectTransfer(true, true);
+                //billAcc.DisableBillAcceptor();
+                //SASCTL.GetInstance().RejectTransfer(true, true);
             }
 
             //if (EGMStatus.GetInstance().current_play.baseWinning)
@@ -497,7 +505,8 @@ namespace EGMENGINE
 
                 webSocket.OnMessage += (s, e) =>
                 {
-                    Logger.Log($"Received WebSocket message: {e.Data}");
+                    if (!e.Data.Contains("ui_pong") && !e.Data.Contains("ui_ping"))
+                        Logger.Log($"Received WebSocket message: {e.Data}");
                     ProcessWebSocketMessageIn(e.Data);
 
                 };
@@ -522,21 +531,55 @@ namespace EGMENGINE
         {
             try
             {
-                Logger.Log($"Processing WebSocket message: {message}");
                 var data = JObject.Parse(message);
+                if (data["event"]?.ToString() == "ui_ping" || data["event"]?.ToString() == "ui_pong")
+                    return;
+
+                var spinConfig_aftlocks = GameGUIController.GetInstance().GUI_GetLastPlay();
+                Logger.Log($"Processing WebSocket message: {message}");
 
                 // Handle GAME_UPDATE - Trigger spin directly in engine
                 if (data["EventType"]?.ToString() == "GAME_UPDATE" &&
-                    data["BetAmount"] != null &&
+                    data["BetAmount"] != null && 
                     data["WinAmount"] != null)
                 {
                     int betAmount = data["BetAmount"].Value<int>();
                     int winAmount = data["WinAmount"].Value<int>();
 
-                    Logger.Log($"Received GAME_UPDATE - Bet: {betAmount}, Win: {winAmount}");
 
-                    // Process the spin on a separate thread to avoid blocking WebSocket
-                    Task.Run(() => TriggerSpinFromWebSocket(betAmount, winAmount));
+                    if (betAmount > 0)
+                    {
+                        // Process the spin 
+                        Logger.Log($"Received GAME_UPDATE - Bet: {betAmount}, Win: {winAmount}");
+                        Task.Run(() => TriggerSpinFromWebSocket(betAmount, winAmount));
+                       
+                    }
+                    
+                    if (aft_pending_no_more_bets)
+                    {
+                        //kick off the aft cashout
+                        HandleTransferConfirmation_BetsClosed(true);
+                        aft_pending_no_more_bets = false;
+                    }
+
+                    no_more_bets = false;
+                    //finished = true
+                    spinConfig_aftlocks.slotplay.Finished = true;
+                    billAcc.EnableBillAcceptor();
+                    SASCTL.GetInstance().AcceptTransfer(true, true);
+                }
+                else if (data["EventType"]?.ToString() == "NO_MORE_BETS")
+                {
+                   
+                    no_more_bets = true;
+                    //finished = false
+                    //EGM.GetInstance().SlotPlay().finished = false;
+                    
+                    spinConfig_aftlocks.slotplay.Finished = false;
+                    
+                    billAcc.DisableBillAcceptor();
+                    SASCTL.GetInstance().RejectTransfer(true, true);
+
                 }
                 else if (data["EventType"]?.ToString() == "CREDIT_UPDATE")
                 {
@@ -566,7 +609,7 @@ namespace EGMENGINE
                 {
                     Logger.Log($"Received ERROR: {data["errorMessage"]}");
                 }
-                else
+                else if (data["event"]?.ToString() != "ui_ping" && data["event"]?.ToString() != "ui_pong")
                 {
                     Logger.Log($"Received unknown message type: {message}");
                 }
@@ -687,7 +730,7 @@ namespace EGMENGINE
                 Status = "SUCCESS"
             };
 
-            SendToWebSocket(completionMessage);
+           // SendToWebSocket(completionMessage);
         }
 
 
@@ -902,8 +945,8 @@ namespace EGMENGINE
 
                     if (s == FrontEndPlayStatus.Playable || s == FrontEndPlayStatus.WaitingForBet || s == FrontEndPlayStatus.WaitingForCredits)
                     {
-                        billAcc.EnableBillAcceptor();
-                        SASCTL.GetInstance().AcceptTransfer(true, true);
+                        //billAcc.EnableBillAcceptor();
+                        //SASCTL.GetInstance().AcceptTransfer(true, true);
                     }
 
                 }
@@ -1162,12 +1205,21 @@ namespace EGMENGINE
                 // Calculate future credits by adding the transfer amount to current credits
                 decimal currentCredits = EGM_GetCurrentCredits() + totalAmount;
                 bool isCashout = t == "Cash Out";
-               
-                SendAFTWebSocket(Math.Abs(totalAmount), isCashout, currentCredits, dc.ToString());
-                Logger.Log($"WebSocket sent: Total amount : {totalAmount}, isCashout: {isCashout}, currentCredits {currentCredits}. Waiting for confirmation...");
-                HandleTransferConfirmation(true);
-                // Start retry timer
-                _websocketRetryTimer.Start();
+
+                if ((t == "Cash Out") && (no_more_bets == true))
+                {
+                    aft_pending_no_more_bets = true;
+
+                }
+                else
+                {
+                    SendAFTWebSocket(Math.Abs(totalAmount), isCashout, currentCredits, dc.ToString());
+                    Logger.Log($"WebSocket sent: Total amount : {totalAmount}, isCashout: {isCashout}, currentCredits {currentCredits}. Waiting for confirmation...");
+                    HandleTransferConfirmation_BetsOpen(true);
+                    // Start retry timer
+                    _websocketRetryTimer.Start();
+                }
+                    
 
                 // Don't process further until confirmation is received
                 //when you get aft_confirmed from websocket, it will automatically call HandleTransferConfirmation(true)
@@ -1310,10 +1362,11 @@ namespace EGMENGINE
         }
 
         // Method to handle transfer confirmation from client (call this when you receive WebSocket response)
-        public void HandleTransferConfirmation(bool confirmed)
+        public void HandleTransferConfirmation_BetsOpen(bool confirmed)
         {
             if (_waitingForConfirmation && _pendingTransferData != null)
             {
+                
                 // Stop retry timer
                 _websocketRetryTimer.Stop();
 
@@ -1328,6 +1381,48 @@ namespace EGMENGINE
                         _pendingTransferData.Restricted,
                         _pendingTransferData.NonRestricted
                     );
+                }
+                else
+                {
+                    // Client rejected transfer - no reversal, just log and reset state
+                    Logger.Log("Transfer rejected by client. Resetting state.");
+
+
+                    EGMStatus.GetInstance().current_collect.Transition(CollectStatus.Waiting72);
+
+                }
+
+                // Reset flags
+                _waitingForConfirmation = false;
+                _pendingTransferData = null;
+            }
+            else
+            {
+                Logger.Log("HandleTransferConfirmation called but no pending transfer to confirm.");
+            }
+        }
+        public void HandleTransferConfirmation_BetsClosed(bool confirmed)
+        {
+            if (_waitingForConfirmation && _pendingTransferData != null)
+            {
+
+                
+
+                if (confirmed)
+                {
+                    // Client confirmed, process the transfer
+                    Logger.Log("Transfer confirmed by client. Processing...");
+                    ProcessTransferCompletion(
+                        _pendingTransferData.Type,
+                        _pendingTransferData.DataCode,
+                        _pendingTransferData.Cashable,
+                        _pendingTransferData.Restricted,
+                        _pendingTransferData.NonRestricted
+                    );
+                    SendAFTWebSocket(Math.Abs(_pendingTransferData.Cashable+_pendingTransferData.Restricted+_pendingTransferData.NonRestricted), true, _pendingTransferData.Cashable + _pendingTransferData.Restricted + _pendingTransferData.NonRestricted, _pendingTransferData.DataCode.ToString());
+                    Logger.Log($"WebSocket sent: Total amount : {_pendingTransferData.Cashable + _pendingTransferData.Restricted + _pendingTransferData.NonRestricted}, isCashout: {true}, currentCredits {_pendingTransferData.Cashable + _pendingTransferData.Restricted + _pendingTransferData.NonRestricted}. Waiting for confirmation...");                
+                    // Start retry timer
+                    _websocketRetryTimer.Start();
                 }
                 else
                 {
@@ -1649,7 +1744,7 @@ namespace EGMENGINE
         {
             // Credits already include the bill amount since AddAmount was called before this method
             // So we just get the current credits without adding the amount again
-            decimal credits = EGM_GetCurrentCredits();
+            decimal credits = 0;
             var message = new
             {
                 EventType = "BILL_INSERTED",
