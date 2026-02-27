@@ -223,13 +223,7 @@ namespace EGMENGINE
         private bool isConnected = false;
         private WebSocketSharp.WebSocket webSocket;
 
-        private bool no_more_bets = false;
-
-        public bool GetNoMoreBets() => no_more_bets;
-        public void SetNoMoreBets(bool value) => no_more_bets = value;
-
-        bool aft_pending_no_more_bets = false;
-
+        
         private readonly object spinLock = new object();
         private int currentBet = 0;  // Default values
         private int currentWin = 0;  // Default values
@@ -556,27 +550,20 @@ namespace EGMENGINE
                        
                     }
                     
-                    if (aft_pending_no_more_bets)
-                    {
-                        //kick off the aft cashout
-                       // HandleTransferConfirmation_BetsClosed(true);
-                        aft_pending_no_more_bets = false;
-                    }
-
-                    no_more_bets = false;
+                    
                     //finished = true
-                    //spinConfig_aftlocks.slotplay.Finished = true;
+                    spinConfig_aftlocks.slotplay.Finished = true;
                     billAcc.EnableBillAcceptor();
                     SASCTL.GetInstance().AcceptTransfer(true, true);
                 }
                 else if (data["EventType"]?.ToString() == "NO_MORE_BETS")
                 {
                    
-                    no_more_bets = true;
+                   
                     //finished = false
                     //EGM.GetInstance().SlotPlay().finished = false;
                     
-                    //spinConfig_aftlocks.slotplay.Finished = false;
+                    spinConfig_aftlocks.slotplay.Finished = false;
                     
                     billAcc.DisableBillAcceptor();
                     SASCTL.GetInstance().RejectTransfer(true, true);
@@ -702,10 +689,10 @@ namespace EGMENGINE
                     Logger.Log($"Final state after processing: {currentState}");
 
                     Logger.Log("Waiting for spin completion...");
-                    Thread.Sleep(10000);
+                    Thread.Sleep(100);
 
-                    SendSpinCompletionMessage(betAmount, winAmount, currentCredits);
-                    Logger.Log("WebSocket spin completed successfully.");
+                    //SendSpinCompletionMessage(betAmount, winAmount, currentCredits);
+                    Logger.Log("EGM Spin completed successfully.");
                 }
                 catch (Exception ex)
                 {
@@ -1215,18 +1202,7 @@ namespace EGMENGINE
                 HandleTransferConfirmation_BetsOpen(true);
                 Logger.Log($"WebSocket sent: Total amount : {totalAmount}, isCashout: {isCashout}, currentCredits {currentCredits}. Waiting for confirmation...");
                 
-                if ((t == "Cash Out") && (no_more_bets == true))
-                {
-                    aft_pending_no_more_bets = true;
-
-                }
-                else
-                {
-                    
-                   // HandleTransferConfirmation_BetsOpen(true);
-                    // Start retry timer
-                    
-                }
+               
                     
 
                 // Don't process further until confirmation is received
