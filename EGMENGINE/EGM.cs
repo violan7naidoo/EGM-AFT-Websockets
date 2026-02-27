@@ -689,7 +689,7 @@ namespace EGMENGINE
                     Logger.Log($"Final state after processing: {currentState}");
 
                     Logger.Log("Waiting for spin completion...");
-                    Thread.Sleep(100);
+                    Thread.Sleep(10000);
 
                     //SendSpinCompletionMessage(betAmount, winAmount, currentCredits);
                     Logger.Log("EGM Spin completed successfully.");
