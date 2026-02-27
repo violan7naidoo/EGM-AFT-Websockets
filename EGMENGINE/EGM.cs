@@ -537,6 +537,7 @@ namespace EGMENGINE
 
                 var spinConfig_aftlocks = GameGUIController.GetInstance().GUI_GetLastPlay();
                 Logger.Log($"Processing WebSocket message: {message}");
+                Logger.Log($"CURRENT DISABLED BY HOST STATUS  ====================: {EGMStatus.GetInstance().disabledByHost}");
 
                 // Handle GAME_UPDATE - Trigger spin directly in engine
                 if (data["EventType"]?.ToString() == "GAME_UPDATE" &&
@@ -558,13 +559,13 @@ namespace EGMENGINE
                     if (aft_pending_no_more_bets)
                     {
                         //kick off the aft cashout
-                        HandleTransferConfirmation_BetsClosed(true);
+                       // HandleTransferConfirmation_BetsClosed(true);
                         aft_pending_no_more_bets = false;
                     }
 
                     no_more_bets = false;
                     //finished = true
-                    spinConfig_aftlocks.slotplay.Finished = true;
+                    //spinConfig_aftlocks.slotplay.Finished = true;
                     billAcc.EnableBillAcceptor();
                     SASCTL.GetInstance().AcceptTransfer(true, true);
                 }
@@ -575,7 +576,7 @@ namespace EGMENGINE
                     //finished = false
                     //EGM.GetInstance().SlotPlay().finished = false;
                     
-                    spinConfig_aftlocks.slotplay.Finished = false;
+                    //spinConfig_aftlocks.slotplay.Finished = false;
                     
                     billAcc.DisableBillAcceptor();
                     SASCTL.GetInstance().RejectTransfer(true, true);
@@ -1021,7 +1022,8 @@ namespace EGMENGINE
             {
                 // Update the disabledByHost
                 EGMStatus.GetInstance().disabledByHost = true;
-
+                Logger.Log($"SAS GAME :  DISABLED SIGNAL");
+                Logger.Log($"GAME FRONTEND PLAY STATUS: {EGMStatus.GetInstance().frontend_play.thisstatus}");
                 // Cash In GM Lock Cnt
                 SASCTL.GetInstance().RejectTransfer(true, true);
 
@@ -1032,7 +1034,8 @@ namespace EGMENGINE
             {
                 // Update the disabledByHost
                 EGMStatus.GetInstance().disabledByHost = false;
-
+                Logger.Log($"SAS GAME :  ENABLED SIGNAL");
+                Logger.Log($"GAME FRONTEND PLAY STATUS: {EGMStatus.GetInstance().frontend_play.thisstatus}");
                 // Cash In GM Lock Cnt
 
                 SASCTL.GetInstance().AcceptTransfer(true, true);
@@ -1205,7 +1208,13 @@ namespace EGMENGINE
                 // Calculate future credits by adding the transfer amount to current credits
                 decimal currentCredits = EGM_GetCurrentCredits() + totalAmount;
                 bool isCashout = t == "Cash Out";
-
+                
+                
+                SendAFTWebSocket(Math.Abs(totalAmount), isCashout, currentCredits, dc.ToString());
+                _websocketRetryTimer.Start();
+                HandleTransferConfirmation_BetsOpen(true);
+                Logger.Log($"WebSocket sent: Total amount : {totalAmount}, isCashout: {isCashout}, currentCredits {currentCredits}. Waiting for confirmation...");
+                
                 if ((t == "Cash Out") && (no_more_bets == true))
                 {
                     aft_pending_no_more_bets = true;
@@ -1213,11 +1222,10 @@ namespace EGMENGINE
                 }
                 else
                 {
-                    SendAFTWebSocket(Math.Abs(totalAmount), isCashout, currentCredits, dc.ToString());
-                    Logger.Log($"WebSocket sent: Total amount : {totalAmount}, isCashout: {isCashout}, currentCredits {currentCredits}. Waiting for confirmation...");
-                    HandleTransferConfirmation_BetsOpen(true);
+                    
+                   // HandleTransferConfirmation_BetsOpen(true);
                     // Start retry timer
-                    _websocketRetryTimer.Start();
+                    
                 }
                     
 
@@ -1435,7 +1443,8 @@ namespace EGMENGINE
                 }
 
                 // Reset flags
-                _waitingForConfirmation = false;
+                
+                    _waitingForConfirmation = false;
                 _pendingTransferData = null;
             }
             else

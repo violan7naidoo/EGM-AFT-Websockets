@@ -86,7 +86,7 @@ namespace EGMENGINE.EGMSettingsModule
             FirstBootAfterHardRC = false;
             MandatoryPC = false;
             DisableBillAcceptorAfterEachAcceptedBill = false;
-            jackpotLimit = 10000000;
+            jackpotLimit = 0;
             jackpotEnabled = false;
             BillAcceptorComPort = "COM4";
             BillAcceptorChannelSet1 = 255;
@@ -116,7 +116,7 @@ namespace EGMENGINE.EGMSettingsModule
             FirstBootAfterHardRC = false;
             MandatoryPC = false;
             DisableBillAcceptorAfterEachAcceptedBill = false;
-            jackpotLimit = 10000000;
+            jackpotLimit = 0;
             jackpotEnabled = false;
             BillAcceptorComPort = "COM4";
             BillAcceptorChannelSet1 = 255;
