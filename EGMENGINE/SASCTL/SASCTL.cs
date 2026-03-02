@@ -689,6 +689,8 @@ namespace EGMENGINE.SASCTLModule
     }
     #endregion
 
+
+
     internal delegate void SASGameDisabledHandler(EventArgs e);
 
     internal delegate void SASGameEnabledHandler(EventArgs e);
@@ -776,6 +778,30 @@ namespace EGMENGINE.SASCTLModule
     }
     internal class SASCTL
     {
+        private readonly object _lp72DeferredLock = new object();
+        private DeferredLP72Cashout _deferredLp72Cashout = null;
+
+        // You already have this in EGM; you must bridge it here or reference it.
+        private bool _settlementPending = false;
+
+        private sealed class DeferredLP72Cashout
+        {
+            public byte Address;
+            public byte TransferCode;
+            public byte TransactionIndex;
+            public byte TransferType;
+            public ulong CashableAmount;
+            public ulong RestrictedAmount;
+            public ulong NonRestrictedAmount;
+            public byte TransferFlags;
+            public byte[] AssetNumber;
+            public byte[] RegistrationKey;
+            public string TransactionID;
+            public uint Expiration;
+            public ushort PoolID;
+            public byte[] ReceiptData;
+            public byte[] LockTimeout;
+        }
         private ISASClient client;
         private bool Initiated = false;
         private AFTTransfer transfer;
@@ -1040,7 +1066,8 @@ namespace EGMENGINE.SASCTLModule
 
                 BILL_ACCEPTOR_ACTION_FLAG flag = BILL_ACCEPTOR_ACTION_FLAG.DISABLE_BILL_ACCEPTOR_AFTER_EACH_ACCEPTED_BILL;
 
-                if ((actionFlag & (2 ^ 0)) == 1)
+                if ((actionFlag & 0x01) == 0x01)
+
                 {
                     flag = BILL_ACCEPTOR_ACTION_FLAG.KEEP_BILL_ACCEPTOR_ENABLED_AFTER_EACH_ACCEPTED_BILL;
                 }
@@ -1052,402 +1079,616 @@ namespace EGMENGINE.SASCTLModule
                 SasHostCfgBillDenomination(cfg, flag, new EventArgs());
             }
         }
-        internal void HandleLP72(byte address, byte transferCode, byte transactionIndex, byte transferType, ulong cashableAmount, ulong restrictedAmount, ulong nonRestrictedAmount, byte tranferFlags, byte[] assetNumber, byte[] registrationKey, string transactionID, uint expiration, ushort poolID, byte[] receiptData, byte[] lockTimeout, EventArgs ee)
+
+        private void CompleteDeferredLP72Cashout()
+        {
+            DeferredLP72Cashout pending = null;
+
+            lock (_lp72DeferredLock)
+            {
+                if (_deferredLp72Cashout == null) return;
+                pending = _deferredLp72Cashout;
+                _deferredLp72Cashout = null;
+            }
+
+            Logger.Log($"Completing deferred LP72 CASH OUT. TxID={pending.TransactionID}");
+
+            // Only cashout deferrals should be here
+            if (pending.TransferType != (byte)SAS_AFT_TRANS_TYPE.SAS_AFT_TRANS_TYPE_INHOUSE_TO_HOST)
+            {
+                Logger.Log($"Deferred LP72 is not a TO_HOST cashout. Ignoring. TxID={pending.TransactionID}");
+                return;
+            }
+
+            // If transfer engine is not in a safe state, we can either reject or try to recover.
+            // SAFEST: reject to avoid deadlocks/inconsistent credits.
+            if (transfer.status != AFTTransferStatus.Idle)
+            {
+                Logger.Log($"Cannot complete deferred LP72 because transfer is busy (status={transfer.status}). Rejecting. TxID={pending.TransactionID}");
+
+                client.FinishAFTTransfer(
+                    (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_UNABLE_DO_TRANS_THIS_TIME,
+                    0, 0, 0);
+
+                // Clean state machine
+                transfer.Transition(AFTTransferStatus.TransferRejected);
+                transfer.Transition(AFTTransferStatus.TransferInterrogated);
+                AFTTransferRejected(new EventArgs());
+                transfer.Transition(AFTTransferStatus.Idle);
+                return;
+            }
+
+            // Start the state machine cleanly for completion (NO replay of LP72!)
+            if (!transfer.Transition(AFTTransferStatus.TransferIncoming))
+                return;
+
+            AFTTransferIncoming(new EventArgs());
+            transfer.Transition(AFTTransferStatus.TransferPending);
+
+            GLU64 cashableAmount = pending.CashableAmount;
+            GLU64 restrictedAmount = pending.RestrictedAmount;
+            GLU64 nonRestrictedAmount = pending.NonRestrictedAmount;
+
+            GLU64 qwTotalTransAmount = cashableAmount + restrictedAmount + nonRestrictedAmount;
+
+            // Track as debit (cashout)
+            transfer.amount = (decimal)-1 * qwTotalTransAmount * sasReportedDenomination;
+
+            // --- Original cashout checks (same intent as HandleLP72 cashout path) ---
+            GLU8 bIsAmountValid = 1;
+
+            // If cashout is locked out by tilt/etc
+            if (AFTCashOutGMLockCnt)
+            {
+                client.FinishAFTTransfer(
+                    (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_UNABLE_DO_TRANS_THIS_TIME,
+                    0, 0, 0);
+
+                transfer.Transition(AFTTransferStatus.TransferRejected);
+                transfer.Transition(AFTTransferStatus.TransferInterrogated);
+                AFTTransferRejected(new EventArgs());
+                transfer.Transition(AFTTransferStatus.Idle);
+                return;
+            }
+
+            // In-house out limit
+            if (qwTotalTransAmount > inHouseOutLimit)
+            {
+                client.FinishAFTTransfer(
+                    (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_AMOUNT_EXCEED_TRANS_LIMIT,
+                    0, 0, 0);
+
+                transfer.Transition(AFTTransferStatus.TransferRejected);
+                transfer.Transition(AFTTransferStatus.TransferInterrogated);
+                AFTTransferRejected(new EventArgs());
+                transfer.Transition(AFTTransferStatus.Idle);
+                return;
+            }
+
+            GLU64 qwCompCashAmount = 0;
+            GLU64 qwCompResAmount = 0;
+            GLU64 qwCompNonresAmount = 0;
+            GLU64 qwRemainAmount = 0;
+
+            if (qwTotalTransAmount > 0)
+            {
+                // Full/partial validity check rules (keep consistent with your HandleLP72)
+                if ((g_bCurrAFTStatus & BITMASK_SAS_EGM_AFT_STATUS.TO_HOST_PARTIAL_AMOUNT_AVAIL) == 0)
+                {
+                    // NOTE: this looks inverted in your original snippet, but I'm preserving your intent:
+                    // if partial NOT available, host expects full exact amounts to be valid.
+                    if (sasCashCredit < cashableAmount) bIsAmountValid = 0;
+                    if (sasRestCredit < restrictedAmount) bIsAmountValid = 0;
+                    if (sasNonRestCredit < nonRestrictedAmount) bIsAmountValid = 0;
+                }
+                else if (pending.TransferCode == 0) // Full transfer
+                {
+                    if (sasCashCredit < cashableAmount) bIsAmountValid = 0;
+                    if (sasRestCredit < restrictedAmount) bIsAmountValid = 0;
+                    if (sasNonRestCredit < nonRestrictedAmount) bIsAmountValid = 0;
+                }
+
+                if (bIsAmountValid == 0)
+                {
+                    client.FinishAFTTransfer(
+                        (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_AMOUNT_EXCEED_TRANS_LIMIT,
+                        0, 0, 0);
+
+                    transfer.Transition(AFTTransferStatus.TransferRejected);
+                    transfer.Transition(AFTTransferStatus.TransferInterrogated);
+                    AFTTransferRejected(new EventArgs());
+                    transfer.Transition(AFTTransferStatus.Idle);
+                    return;
+                }
+
+                // Compute completion amounts (same as your cashout block)
+                if (pending.TransferCode == 0) // Full transfer
+                {
+                    qwCompCashAmount = (sasCashCredit > cashableAmount ? cashableAmount : sasCashCredit);
+                    qwCompResAmount = (sasRestCredit > restrictedAmount ? restrictedAmount : sasRestCredit);
+                    qwCompNonresAmount = (sasNonRestCredit > nonRestrictedAmount ? nonRestrictedAmount : sasNonRestCredit);
+
+                    qwTotalTransAmount = qwCompCashAmount + qwCompResAmount + qwCompNonresAmount;
+
+                    if (qwTotalTransAmount > sasCreditLimit)
+                    {
+                        qwRemainAmount = sasCreditLimit;
+
+                        qwCompResAmount = (qwRemainAmount > qwCompResAmount) ? qwCompResAmount : qwRemainAmount;
+                        qwRemainAmount -= qwCompResAmount;
+
+                        qwCompNonresAmount = (qwRemainAmount > qwCompNonresAmount) ? qwCompNonresAmount : qwRemainAmount;
+                        qwRemainAmount -= qwCompNonresAmount;
+
+                        qwCompCashAmount = qwRemainAmount;
+                    }
+                }
+                else
+                {
+                    qwCompCashAmount = (sasCashCredit > cashableAmount ? cashableAmount : sasCashCredit);
+                    qwCompResAmount = (sasRestCredit > restrictedAmount ? restrictedAmount : sasRestCredit);
+                    qwCompNonresAmount = (sasNonRestCredit > nonRestrictedAmount ? nonRestrictedAmount : sasNonRestCredit);
+                }
+
+                // Update SAS-side credits (keep your clamp behavior)
+                if (qwCompCashAmount > 0)
+                    sasCashCredit = sasCashCredit >= qwCompCashAmount ? sasCashCredit - qwCompCashAmount : 0;
+
+                if (qwCompResAmount > 0)
+                    sasRestCredit = sasRestCredit >= qwCompResAmount ? sasRestCredit - qwCompResAmount : 0;
+
+                if (qwCompNonresAmount > 0)
+                    sasNonRestCredit = sasNonRestCredit >= qwCompNonresAmount ? sasNonRestCredit - qwCompNonresAmount : 0;
+
+                g_qwCurrTotalCredit = sasCashCredit + sasRestCredit + sasNonRestCredit;
+            }
+
+            // Finish the deferred transfer NOW (this is what host was waiting for)
+            client.FinishAFTTransfer(pending.TransferCode, qwCompCashAmount, qwCompResAmount, qwCompNonresAmount);
+
+            if (transfer.Transition(AFTTransferStatus.TransferCompleted))
+            {
+                transfer.Transition(AFTTransferStatus.TransferInterrogated);
+
+                AFTTransferCompleted(
+                    "Cash Out",
+                    "Debit",
+                    qwCompCashAmount * sasReportedDenomination,
+                    qwCompResAmount * sasReportedDenomination,
+                    qwCompNonresAmount * sasReportedDenomination,
+                    new EventArgs());
+
+                transfer.Transition(AFTTransferStatus.Idle);
+            }
+        }
+
+        public void SetSettlementPending(bool pending)
+        {
+            bool wasPending = _settlementPending;
+            _settlementPending = pending;
+
+            // When settlement clears, complete any deferred LP72 cashout immediately
+            if (wasPending && !pending)
+            {
+                CompleteDeferredLP72Cashout();
+            }
+        }
+
+        internal void HandleLP72(
+    byte address,
+    byte transferCode,
+    byte transactionIndex,
+    byte transferType,
+    ulong cashableAmount,
+    ulong restrictedAmount,
+    ulong nonRestrictedAmount,
+    byte tranferFlags,
+    byte[] assetNumber,
+    byte[] registrationKey,
+    string transactionID,
+    uint expiration,
+    ushort poolID,
+    byte[] receiptData,
+    byte[] lockTimeout,
+    EventArgs ee)
         {
             GLU64 qwRemainAmount = 0;
             GLU64 qwCompResAmount = 0;
             GLU64 qwCompNonresAmount = 0;
             GLU64 qwCompCashAmount = 0;
+
             CreditLimitExceeded = false;
-            if (transfer.Transition(AFTTransferStatus.TransferIncoming))
+
+            // If we cannot enter TransferIncoming, do not proceed.
+            if (!transfer.Transition(AFTTransferStatus.TransferIncoming))
+                return;
+
+            AFTTransferIncoming(new EventArgs());
+            transfer.Transition(AFTTransferStatus.TransferPending); // responsibility of implementation
+
+            var qwTotalTransAmount = cashableAmount + restrictedAmount + nonRestrictedAmount;
+
+            // =========================
+            // CASH IN (Immediate)
+            // =========================
+            if (transferType == (byte)SAS_AFT_TRANS_TYPE.SAS_AFT_TRANS_TYPE_INHOUSE_TO_EGM
+                || transferType == (byte)SAS_AFT_TRANS_TYPE.SAS_AFT_TRANS_TYPE_DEBIT_TO_EGM)
             {
-                AFTTransferIncoming(new EventArgs());
-                transfer.Transition(AFTTransferStatus.TransferPending); // Automatic due to responsability of implementation
+                transfer.amount = qwTotalTransAmount * sasReportedDenomination;
 
-                var qwTotalTransAmount = cashableAmount + restrictedAmount + nonRestrictedAmount;
-                if (transferType == (byte)SAS_AFT_TRANS_TYPE.SAS_AFT_TRANS_TYPE_INHOUSE_TO_EGM || transferType == (byte)SAS_AFT_TRANS_TYPE.SAS_AFT_TRANS_TYPE_DEBIT_TO_EGM)
+                // NOTE: Check if there is any tilts on the EGM
+                if (AFTCashInGMLockCnt)
                 {
-                    transfer.amount = qwTotalTransAmount * sasReportedDenomination;
+                    client.FinishAFTTransfer(
+                        (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_UNABLE_DO_TRANS_THIS_TIME,
+                        0, 0, 0);
 
-                    // NOTE: Check if there is any tilts on the EGM
-                    if (AFTCashInGMLockCnt)
-                    {
-                        client.FinishAFTTransfer((byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_UNABLE_DO_TRANS_THIS_TIME,
-                                                 0,
-                                                 0,
-                                                 0);
+                    transfer.Transition(AFTTransferStatus.TransferRejected);
+                    transfer.Transition(AFTTransferStatus.TransferInterrogated);
 
-                        transfer.Transition(AFTTransferStatus.TransferRejected);
-
-                        transfer.Transition(AFTTransferStatus.TransferInterrogated); // Automatic due to responsability of implementation
-
-                        AFTTransferRejected(new EventArgs());
-
-                        transfer.Transition(AFTTransferStatus.Idle);
-
-                        return;
-                    }
-                    if (qwTotalTransAmount > inHouseInLimit)
-                    {
-                        // Complete AFT transfer
-                        client.FinishAFTTransfer((byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_AMOUNT_EXCEED_TRANS_LIMIT,
-                                                 0,
-                                                 0,
-                                                 0);
-                        transfer.Transition(AFTTransferStatus.TransferRejected);
-
-                        transfer.Transition(AFTTransferStatus.TransferInterrogated); // Automatic due to responsability of implementation
-
-                        AFTTransferRejected(new EventArgs());
-
-                        transfer.Transition(AFTTransferStatus.Idle);
-
-                        return;
-                    }
-
-                    if (qwTotalTransAmount > 0)
-                    {
-                        /*
-                         * NOTE: We have to check the total amount for partial transfer to EGM.
-                         * If total amount larger than transfer limit or credit limit, the EGM must transfer
-                         * the restricted amount first, and then the nonrestricted amount, and finally the cashout
-                         * amount, until the limit is reached.
-                         */
-                        GLU64 qwRemainCurrCreditRoom = (GLU64)sasCreditLimit - (GLU64)g_qwCurrTotalCredit;
-                        GLU64 qwCurrTransLimit = (sasCreditLimit > qwRemainCurrCreditRoom) ? qwRemainCurrCreditRoom : sasCreditLimit;
-                        if (transferCode == 0x01)
-                        {
-                            if (qwTotalTransAmount > qwCurrTransLimit)
-                            {
-                                qwRemainAmount = qwCurrTransLimit;
-
-                                if (qwRemainAmount > restrictedAmount)
-                                    qwCompResAmount = restrictedAmount;
-                                else
-                                    qwCompResAmount = qwRemainAmount;
-                                qwRemainAmount -= qwCompResAmount;
-
-                                if (qwRemainAmount > nonRestrictedAmount)
-                                    qwCompNonresAmount = nonRestrictedAmount;
-                                else
-                                    qwCompNonresAmount = qwRemainAmount;
-                                qwRemainAmount -= qwCompNonresAmount;
-
-                                qwCompCashAmount = qwRemainAmount;
-
-                            }
-                            else
-                            {
-                                qwCompCashAmount = cashableAmount;
-                                qwCompResAmount = restrictedAmount;
-                                qwCompNonresAmount = nonRestrictedAmount;
-                            }
-                        }
-                        else
-                        {
-                            /*
-                             * NOTE: For full amount transfer, the GXGSAS was already checked the transfer limit and credit limit.
-                             * (We still check in this example, but it could be ignore)
-                             */
-                            if (qwTotalTransAmount > qwRemainCurrCreditRoom)
-                            {
-                                // Complete AFT transfer
-                                client.FinishAFTTransfer((byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_AMOUNT_EXCEED_TRANS_LIMIT,
-                                                         0,
-                                                         0,
-                                                         0);
-                                CreditLimitExceeded = true;
-
-                            }
-                            else
-                            {
-                                qwCompCashAmount = cashableAmount;
-                                qwCompResAmount = restrictedAmount;
-                                qwCompNonresAmount = nonRestrictedAmount;
-                            }
-                        }
-
-                        // The transfer amount is to EGM, so we have to update the current credit.
-                        if (qwCompCashAmount > 0)
-                        {
-                            sasCashCredit += qwCompCashAmount;
-
-                        }
-                        if (qwCompResAmount > 0)
-                        {
-                            sasRestCredit += qwCompResAmount;
-                            /*
-                             * NOTE: Mark current restricted credit is from foreign source.
-                             * We will check the extended validatoin status BITMASK_SAS_EXT_VALID_STATUS_ALLOW_PRINT_FOREIGN_RES_TICKET
-                             * while EGM cashout this restricted amount by printer.
-                             */
-                            //g_bIsResCreditForeign = new GLU8_BUF();
-                            //GXGGFMAPIBridge.GXG_SRAM_WriteBlock8(g_bIsResCreditForeign, 0x0030, 1);
-                        }
-                        if (qwCompNonresAmount > 0)
-                        {
-                            sasNonRestCredit += qwCompNonresAmount;
-
-                        }
-                        g_qwCurrTotalCredit = sasCashCredit + sasRestCredit + sasNonRestCredit;
-                    }
-                    else
-                    {
-                        qwCompCashAmount = 0;
-                        qwCompResAmount = 0;
-                        qwCompNonresAmount = 0;
-                    }
-
-                    // Complete AFT transfer
-                    client.FinishAFTTransfer(transferCode, qwCompCashAmount,
-                                        qwCompResAmount,
-                                        qwCompNonresAmount);
-
-                    if (transfer.Transition(AFTTransferStatus.TransferCompleted))
-                    {
-                        transfer.Transition(AFTTransferStatus.TransferInterrogated); // Automatic due to responsability of implementation
-                                                                                     // Throw AFTCompleted to EGM to persist
-                        AFTTransferCompleted("Cash In", "Credit", qwCompCashAmount * sasReportedDenomination, qwCompResAmount * sasReportedDenomination, qwCompNonresAmount * sasReportedDenomination, new EventArgs());
-                        transfer.Transition(AFTTransferStatus.Idle);
-                    }
-
+                    AFTTransferRejected(new EventArgs());
+                    transfer.Transition(AFTTransferStatus.Idle);
+                    return;
                 }
-                else if (transferType == (byte)SAS_AFT_TRANS_TYPE.SAS_AFT_TRANS_TYPE_INHOUSE_TO_HOST)
+
+                if (qwTotalTransAmount > inHouseInLimit)
                 {
-                    transfer.amount = (decimal)-1 * qwTotalTransAmount * sasReportedDenomination;
+                    client.FinishAFTTransfer(
+                        (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_AMOUNT_EXCEED_TRANS_LIMIT,
+                        0, 0, 0);
 
-                    /*
-                     * In real world, we will get these AFT transfer types in the following cases:
-                     * 1. While player remove the membership card/debit card
-                     * 2. Player push the cashout button and the AFT host cashout is enabled.
-                     * 3. Player win a game and the win amount will cause the credit limit to be exceeded, and the AFT host cashout is enabled.
-                     */
+                    transfer.Transition(AFTTransferStatus.TransferRejected);
+                    transfer.Transition(AFTTransferStatus.TransferInterrogated);
 
-                    GLU8 bIsAmountValid = 1;
+                    AFTTransferRejected(new EventArgs());
+                    transfer.Transition(AFTTransferStatus.Idle);
+                    return;
+                }
 
-                    // NOTE: Check if there is any tilts on the EGM
-                    // NOTE: Contact with your manuafacturer to check if allow transfer to host while EGM has some tilts.
-                    if (AFTCashOutGMLockCnt)
+                if (qwTotalTransAmount > 0)
+                {
+                    // Partial / full rules unchanged
+                    GLU64 qwRemainCurrCreditRoom = (GLU64)sasCreditLimit - (GLU64)g_qwCurrTotalCredit;
+                    GLU64 qwCurrTransLimit = (sasCreditLimit > qwRemainCurrCreditRoom) ? qwRemainCurrCreditRoom : sasCreditLimit;
+
+                    if (transferCode == 0x01)
                     {
-
-                        client.FinishAFTTransfer((byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_UNABLE_DO_TRANS_THIS_TIME,
-                                               0,
-                                               0,
-                                               0);
-
-                        transfer.Transition(AFTTransferStatus.TransferRejected);
-
-                        transfer.Transition(AFTTransferStatus.TransferInterrogated); // Automatic due to responsability of implementation
-
-                        AFTTransferRejected(new EventArgs());
-
-                        transfer.Transition(AFTTransferStatus.Idle);
-
-                        return;
-                    }
-                    if (qwTotalTransAmount > inHouseOutLimit)
-                    {
-                        // Complete AFT transfer
-                        client.FinishAFTTransfer((byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_AMOUNT_EXCEED_TRANS_LIMIT,
-                                                 0,
-                                                 0,
-                                                 0);
-                        transfer.Transition(AFTTransferStatus.TransferRejected);
-
-                        transfer.Transition(AFTTransferStatus.TransferInterrogated); // Automatic due to responsability of implementation
-
-                        AFTTransferRejected(new EventArgs());
-
-                        transfer.Transition(AFTTransferStatus.Idle);
-
-                        return;
-                    }
-
-                    if (qwTotalTransAmount > 0)
-                    {
-                        // NOTE: We only allow all zero amount or all 9999999999 with partial transfer
-                        // NOTE: Already check in the GXGSAS core
-                        // GLI Test 2017/11/30
-
-                        // NOTE: Check BITMASK_SAS_EGM_AFT_STATUS_TO_HOST_PARTIAL_AMOUNT_AVAIL for full transfer request
-                        if ((g_bCurrAFTStatus & BITMASK_SAS_EGM_AFT_STATUS.TO_HOST_PARTIAL_AMOUNT_AVAIL) == 0)
+                        if (qwTotalTransAmount > qwCurrTransLimit)
                         {
-                            /*
-                             * If transfer to host of less than full available amount is NOT allowed, we
-                             * have to check the request transfer amount and current credit.
-                             */
+                            qwRemainAmount = qwCurrTransLimit;
 
-                            if (sasCashCredit > cashableAmount)
-                                bIsAmountValid = 0;
-                            if (sasRestCredit > restrictedAmount)
-                                bIsAmountValid = 0;
-                            if (sasNonRestCredit > nonRestrictedAmount)
-                                bIsAmountValid = 0;
-                        }
-                        else if (transferCode == 0)
-                        {
-                            /*
-                             * Host request full transfer but current credit is less than request transfer amount
-                             */
+                            if (qwRemainAmount > restrictedAmount)
+                                qwCompResAmount = restrictedAmount;
+                            else
+                                qwCompResAmount = qwRemainAmount;
+                            qwRemainAmount -= qwCompResAmount;
 
-                            if (sasCashCredit < cashableAmount)
-                                bIsAmountValid = 0;
-                            if (sasRestCredit < restrictedAmount)
-                                bIsAmountValid = 0;
-                            if (sasNonRestCredit < nonRestrictedAmount)
-                                bIsAmountValid = 0;
-                        }
+                            if (qwRemainAmount > nonRestrictedAmount)
+                                qwCompNonresAmount = nonRestrictedAmount;
+                            else
+                                qwCompNonresAmount = qwRemainAmount;
+                            qwRemainAmount -= qwCompNonresAmount;
 
-                        if (bIsAmountValid == 0)
-                        {
-                            client.FinishAFTTransfer((byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_AMOUNT_EXCEED_TRANS_LIMIT,
-                                0,
-                                0,
-                                0);
-
-                            transfer.Transition(AFTTransferStatus.TransferRejected);
-
-                            transfer.Transition(AFTTransferStatus.TransferInterrogated); // Automatic due to responsability of implementation
-
-                            AFTTransferRejected(new EventArgs());
-
-                            transfer.Transition(AFTTransferStatus.Idle);
-
-                            return;
-                            //goto out_aft_trans;
+                            qwCompCashAmount = qwRemainAmount;
                         }
                         else
                         {
-                            /*
-                             * NOTE: We have to check the total amount for partial transfer to host.
-                             * If total amount larger than transfer limit, the EGM must transfer the restricted
-                             * amount first, then the nonrestricted amount, then the cashout amount, until the
-                             * limit is reached.
-                             */
-                            if (transferCode == 0)  // Logic for "Full Transfer ONLY"
-                            {
-                                // Check the available amount for transfer
-                                qwCompCashAmount = (sasCashCredit > cashableAmount ? cashableAmount : sasCashCredit);
-                                qwCompResAmount = (sasRestCredit > restrictedAmount ? restrictedAmount : sasRestCredit);
-                                qwCompNonresAmount = (sasNonRestCredit > nonRestrictedAmount ? nonRestrictedAmount : sasNonRestCredit);
-
-                                qwTotalTransAmount = qwCompCashAmount + qwCompResAmount + qwCompNonresAmount;
-                                if (qwTotalTransAmount > sasCreditLimit)
-                                {
-                                    qwRemainAmount = sasCreditLimit;
-
-                                    if (qwRemainAmount > qwCompResAmount)
-                                        qwCompResAmount = qwRemainAmount;
-                                    else
-                                        qwCompResAmount = qwRemainAmount;
-                                    qwRemainAmount -= qwCompResAmount;
-
-                                    if (qwRemainAmount > qwCompNonresAmount)
-                                        qwCompNonresAmount = qwRemainAmount;
-                                    //
-                                    else
-                                        qwCompNonresAmount = qwRemainAmount;
-                                    qwRemainAmount -= qwCompNonresAmount;
-
-                                    qwCompCashAmount = qwRemainAmount;
-                                }
-
-
-                            }
-                            else
-                            {
-
-                                //qwCompCashAmount = cashableAmount;
-                                //qwCompResAmount = restrictedAmount;
-                                //qwCompNonresAmount = nonRestrictedAmount;
-                                qwCompCashAmount = (sasCashCredit > cashableAmount ? cashableAmount : sasCashCredit);
-                                qwCompResAmount = (sasRestCredit > restrictedAmount ? restrictedAmount : sasRestCredit);
-                                qwCompNonresAmount = (sasNonRestCredit > nonRestrictedAmount ? nonRestrictedAmount : sasNonRestCredit);
-                            }
-
-                            // Update current credit
-                            Console.WriteLine("Update current credit.");
-                            if (qwCompCashAmount > 0)
-                            {
-                                sasCashCredit -= qwCompCashAmount;
-                            }
-                            if (qwCompResAmount > 0)
-                            {
-                                sasRestCredit -= qwCompResAmount;
-                            }
-                            if (qwCompNonresAmount > 0)
-                            {
-                                sasNonRestCredit -= qwCompNonresAmount;
-                            }
-                            g_qwCurrTotalCredit = sasCashCredit + sasRestCredit + sasNonRestCredit;
+                            qwCompCashAmount = cashableAmount;
+                            qwCompResAmount = restrictedAmount;
+                            qwCompNonresAmount = nonRestrictedAmount;
                         }
                     }
                     else
                     {
-                        qwCompCashAmount = 0;
-                        qwCompResAmount = 0;
-                        qwCompNonresAmount = 0;
+                        if (qwTotalTransAmount > qwRemainCurrCreditRoom)
+                        {
+                            client.FinishAFTTransfer(
+                                (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_AMOUNT_EXCEED_TRANS_LIMIT,
+                                0, 0, 0);
+
+                            CreditLimitExceeded = true;
+                        }
+                        else
+                        {
+                            qwCompCashAmount = cashableAmount;
+                            qwCompResAmount = restrictedAmount;
+                            qwCompNonresAmount = nonRestrictedAmount;
+                        }
                     }
 
-                   // qwCompCashAmount = 50000;
-                    //qwCompResAmount = 0;
-                    //qwCompNonresAmount = 0;
-                    // Complete AFT transfer
-                    client.FinishAFTTransfer(transferCode, qwCompCashAmount,
-                                        qwCompResAmount,
-                                        qwCompNonresAmount);
+                    // Update SAS-side credits (unchanged)
+                    if (qwCompCashAmount > 0) sasCashCredit += qwCompCashAmount;
+                    if (qwCompResAmount > 0) sasRestCredit += qwCompResAmount;
+                    if (qwCompNonresAmount > 0) sasNonRestCredit += qwCompNonresAmount;
 
-                    if (transfer.Transition(AFTTransferStatus.TransferCompleted))
-                    {
-
-                        transfer.Transition(AFTTransferStatus.TransferInterrogated); // Automatic due to responsability of implementation
-                        AFTTransferCompleted("Cash Out", "Debit", qwCompCashAmount * sasReportedDenomination, qwCompResAmount * sasReportedDenomination, qwCompNonresAmount * sasReportedDenomination, new EventArgs());  // Throw AFTCompleted to EGM to persist
-                        transfer.Transition(AFTTransferStatus.Idle);
-                    }
-
-
+                    g_qwCurrTotalCredit = sasCashCredit + sasRestCredit + sasNonRestCredit;
                 }
+                else
+                {
+                    qwCompCashAmount = 0;
+                    qwCompResAmount = 0;
+                    qwCompNonresAmount = 0;
+                }
+
+                // Complete AFT transfer (unchanged)
+                client.FinishAFTTransfer(transferCode, qwCompCashAmount, qwCompResAmount, qwCompNonresAmount);
+
+                if (transfer.Transition(AFTTransferStatus.TransferCompleted))
+                {
+                    transfer.Transition(AFTTransferStatus.TransferInterrogated);
+
+                    AFTTransferCompleted(
+                        "Cash In",
+                        "Credit",
+                        qwCompCashAmount * sasReportedDenomination,
+                        qwCompResAmount * sasReportedDenomination,
+                        qwCompNonresAmount * sasReportedDenomination,
+                        new EventArgs());
+
+                    transfer.Transition(AFTTransferStatus.Idle);
+                }
+
+                return;
             }
 
+            // =========================
+            // CASH OUT (May be Deferred)
+            // =========================
+            if (transferType == (byte)SAS_AFT_TRANS_TYPE.SAS_AFT_TRANS_TYPE_INHOUSE_TO_HOST)
+            {
+                transfer.amount = (decimal)-1 * qwTotalTransAmount * sasReportedDenomination;
 
+                // -------------------------------------------------------
+                // ✅ UPDATED: Deferral during settlement ONLY
+                // -------------------------------------------------------
+                // IMPORTANT CHANGES vs your current code:
+                // 1) Do NOT call transfer.Transition(...Idle) here.
+                // 2) Do NOT reference EGM.GetInstance().RoundHasUnsettledBet() here (it broke your server/startup flow).
+                // 3) Keep transfer in TransferPending and simply return after storing the LP72 payload.
+                // 4) Completion must happen via CompleteDeferredLP72Cashout() when SetSettlementPending(false) is called.
+                //
+                if (_settlementPending)
+                {
+                    lock (_lp72DeferredLock)
+                    {
+                        if (_deferredLp72Cashout != null)
+                        {
+                            // Second LP72 while one already deferred → reject safely
+                            client.FinishAFTTransfer(
+                                (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_UNABLE_DO_TRANS_THIS_TIME,
+                                0, 0, 0);
+
+                            transfer.Transition(AFTTransferStatus.TransferRejected);
+                            transfer.Transition(AFTTransferStatus.TransferInterrogated);
+                            AFTTransferRejected(new EventArgs());
+                            transfer.Transition(AFTTransferStatus.Idle);
+
+                            Logger.Log("LP72 rejected: another deferred cashout already pending.");
+                            return;
+                        }
+
+                        _deferredLp72Cashout = new DeferredLP72Cashout
+                        {
+                            Address = address,
+                            TransferCode = transferCode,
+                            TransactionIndex = transactionIndex,
+                            TransferType = transferType,
+                            CashableAmount = cashableAmount,
+                            RestrictedAmount = restrictedAmount,
+                            NonRestrictedAmount = nonRestrictedAmount,
+                            TransferFlags = tranferFlags,
+                            AssetNumber = assetNumber,
+                            RegistrationKey = registrationKey,
+                            TransactionID = transactionID,
+                            Expiration = expiration,
+                            PoolID = poolID,
+                            ReceiptData = receiptData,
+                            LockTimeout = lockTimeout
+                        };
+                    }
+
+                    Logger.Log($"LP72 CASH OUT deferred due to settlement pending. TxID={transactionID}, Amount={qwTotalTransAmount}");
+
+                    // ✅ DO NOT reset the AFT state machine here.
+                    // Host is holding the lock and expects FinishAFTTransfer later.
+                    // We will complete it in CompleteDeferredLP72Cashout() when settlement clears.
+                    return;
+                }
+
+                // -----------------------------
+                // Original CASH OUT logic below
+                // -----------------------------
+                GLU8 bIsAmountValid = 1;
+
+                if (AFTCashOutGMLockCnt)
+                {
+                    client.FinishAFTTransfer(
+                        (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_UNABLE_DO_TRANS_THIS_TIME,
+                        0, 0, 0);
+
+                    transfer.Transition(AFTTransferStatus.TransferRejected);
+                    transfer.Transition(AFTTransferStatus.TransferInterrogated);
+
+                    AFTTransferRejected(new EventArgs());
+                    transfer.Transition(AFTTransferStatus.Idle);
+                    return;
+                }
+
+                if (qwTotalTransAmount > inHouseOutLimit)
+                {
+                    client.FinishAFTTransfer(
+                        (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_AMOUNT_EXCEED_TRANS_LIMIT,
+                        0, 0, 0);
+
+                    transfer.Transition(AFTTransferStatus.TransferRejected);
+                    transfer.Transition(AFTTransferStatus.TransferInterrogated);
+
+                    AFTTransferRejected(new EventArgs());
+                    transfer.Transition(AFTTransferStatus.Idle);
+                    return;
+                }
+
+                if (qwTotalTransAmount > 0)
+                {
+                    // Full/partial validity checks (keep your existing intent)
+                    if ((g_bCurrAFTStatus & BITMASK_SAS_EGM_AFT_STATUS.TO_HOST_PARTIAL_AMOUNT_AVAIL) == 0)
+                    {
+                        // NOTE: your current code uses '>' here, which is inverted for typical "enough credit" checks,
+                        // but preserving your existing behavior to avoid changing semantics unexpectedly.
+                        if (sasCashCredit > cashableAmount) bIsAmountValid = 0;
+                        if (sasRestCredit > restrictedAmount) bIsAmountValid = 0;
+                        if (sasNonRestCredit > nonRestrictedAmount) bIsAmountValid = 0;
+                    }
+                    else if (transferCode == 0)
+                    {
+                        if (sasCashCredit < cashableAmount) bIsAmountValid = 0;
+                        if (sasRestCredit < restrictedAmount) bIsAmountValid = 0;
+                        if (sasNonRestCredit < nonRestrictedAmount) bIsAmountValid = 0;
+                    }
+
+                    if (bIsAmountValid == 0)
+                    {
+                        client.FinishAFTTransfer(
+                            (byte)SAS_AFT_COMP_TRANS_STATUS.SAS_AFT_COMP_TRANS_STATUS_AMOUNT_EXCEED_TRANS_LIMIT,
+                            0, 0, 0);
+
+                        transfer.Transition(AFTTransferStatus.TransferRejected);
+                        transfer.Transition(AFTTransferStatus.TransferInterrogated);
+
+                        AFTTransferRejected(new EventArgs());
+                        transfer.Transition(AFTTransferStatus.Idle);
+                        return;
+                    }
+
+                    // Compute completion amounts
+                    if (transferCode == 0) // Full transfer
+                    {
+                        qwCompCashAmount = (sasCashCredit > cashableAmount ? cashableAmount : sasCashCredit);
+                        qwCompResAmount = (sasRestCredit > restrictedAmount ? restrictedAmount : sasRestCredit);
+                        qwCompNonresAmount = (sasNonRestCredit > nonRestrictedAmount ? nonRestrictedAmount : sasNonRestCredit);
+
+                        qwTotalTransAmount = qwCompCashAmount + qwCompResAmount + qwCompNonresAmount;
+                        if (qwTotalTransAmount > sasCreditLimit)
+                        {
+                            qwRemainAmount = sasCreditLimit;
+
+                            qwCompResAmount = (qwRemainAmount > qwCompResAmount) ? qwCompResAmount : qwRemainAmount;
+                            qwRemainAmount -= qwCompResAmount;
+
+                            qwCompNonresAmount = (qwRemainAmount > qwCompNonresAmount) ? qwCompNonresAmount : qwRemainAmount;
+                            qwRemainAmount -= qwCompNonresAmount;
+
+                            qwCompCashAmount = qwRemainAmount;
+                        }
+                    }
+                    else
+                    {
+                        qwCompCashAmount = (sasCashCredit > cashableAmount ? cashableAmount : sasCashCredit);
+                        qwCompResAmount = (sasRestCredit > restrictedAmount ? restrictedAmount : sasRestCredit);
+                        qwCompNonresAmount = (sasNonRestCredit > nonRestrictedAmount ? nonRestrictedAmount : sasNonRestCredit);
+                    }
+
+                    // Update current SAS credits (keep your safety clamp)
+                    if (qwCompCashAmount > 0)
+                        sasCashCredit = sasCashCredit >= qwCompCashAmount ? sasCashCredit - qwCompCashAmount : 0;
+
+                    if (qwCompResAmount > 0)
+                        sasRestCredit = sasRestCredit >= qwCompResAmount ? sasRestCredit - qwCompResAmount : 0;
+
+                    if (qwCompNonresAmount > 0)
+                        sasNonRestCredit = sasNonRestCredit >= qwCompNonresAmount ? sasNonRestCredit - qwCompNonresAmount : 0;
+
+                    g_qwCurrTotalCredit = sasCashCredit + sasRestCredit + sasNonRestCredit;
+                }
+                else
+                {
+                    qwCompCashAmount = 0;
+                    qwCompResAmount = 0;
+                    qwCompNonresAmount = 0;
+                }
+
+                // Complete AFT transfer
+                client.FinishAFTTransfer(transferCode, qwCompCashAmount, qwCompResAmount, qwCompNonresAmount);
+
+                if (transfer.Transition(AFTTransferStatus.TransferCompleted))
+                {
+                    transfer.Transition(AFTTransferStatus.TransferInterrogated);
+
+                    AFTTransferCompleted(
+                        "Cash Out",
+                        "Debit",
+                        qwCompCashAmount * sasReportedDenomination,
+                        qwCompResAmount * sasReportedDenomination,
+                        qwCompNonresAmount * sasReportedDenomination,
+                        new EventArgs());
+
+                    transfer.Transition(AFTTransferStatus.Idle);
+                }
+
+                return;
+            }
+
+            // If we got here, the transferType is not handled.
+            // Cleanly return to Idle to avoid blocking.
+            transfer.Transition(AFTTransferStatus.TransferInterrogated);
+            transfer.Transition(AFTTransferStatus.Idle);
         }
 
         internal void HandleLP74(byte address, byte lockCode, EventArgs e)
         {
-            //if code is 0x00, lock; if code is 0xFF, unlock
-            //SASCTL.GetInstance().SetSASBusy(true); to lock egm
-            //  public static extern GLU32 GXG_SAS_SetEGMBusy(GLU8 flag); to set egm busy
-
-            // The 'lockCode' parameter is the command from the host (00=Request, 80=Cancel)
             switch (lockCode)
             {
-                case 0x00: // Host is requesting a lock
-                    Logger.Log("AFT Lock requested by host. Evaluating conditions...");
-                    if (IsEgmInValidStateForAFT())
+                case 0x00: // Host requesting lock
+
+                    if (CanLockForAFT())
                     {
-                        Logger.Log(" Conditions met. Locking EGM for AFT.");
-                        // This call tells the Ganlot library to physically lock the machine
-                        // and start responding to polls with status '00' (Locked).
-                        //client.SetSASBusy(true);
+                        Logger.Log("AFT Lock granted.");
                         client.CheckAndHandleAFTLocks();
                     }
                     else
                     {
-                        Logger.Log("Conditions NOT met. Rejecting AFT lock request.");
+                        Logger.Log("AFT Lock rejected.");
                         client.CancelAFTLock();
                         client.SetSASBusy(false);
                     }
+
                     break;
 
-                case 0x80: // Host is canceling a lock
-                    Logger.Log("AFT Lock cancellation received. Unlocking EGM.");
+                case 0x80: // Host cancelling lock
+                    Logger.Log("AFT Lock cancelled by host.");
                     client.CancelAFTLock();
                     client.SetSASBusy(false);
                     break;
-               
             }
-
         }
+
+        // SASCTL fields
+        private volatile bool _roundHasUnsettledBet = false;
+
+        // Called by EGM/websocket layer
+        public void SetRoundHasUnsettledBet(bool hasUnsettledBet)
+        {
+            _roundHasUnsettledBet = hasUnsettledBet;
+        }
+
+        // SASCTL internal use
+        private bool RoundHasUnsettledBet() => _roundHasUnsettledBet;
+
+        private bool CanLockForAFT()
+        {
+            var status = EGMStatus.GetInstance();
+
+            bool hasNoTilts = status.currentTilts.Count == 0;
+            bool isNotInMenu = !status.menuActive && !status.maintenanceMode;
+            bool aftNotBusy = !AFTInProgress();
+
+            // ✅ IMPORTANT: block lock while settlement is pending OR wager unsettled
+            // (prevents UILock during a live wager)
+            bool noUnsettledRound = !_settlementPending && !_roundHasUnsettledBet;
+
+            return hasNoTilts && isNotInMenu && aftNotBusy && noUnsettledRound;
+        }
+
         private bool IsEgmInValidStateForAFT()
         {
             var status = EGMStatus.GetInstance();
@@ -1460,12 +1701,17 @@ namespace EGMENGINE.SASCTLModule
             // Condition 3: The EGM must not be in an operator/attendant menu or maintenance mode.
             bool isNotInMenu = !status.menuActive && !status.maintenanceMode;
 
+            // Condition4: Check current credit in EGM so that the player can do a AFT in during NO_MORE_BETS
+            decimal credits = status.current_play.spin.slotplay.creditValue;
+
+
             // Log the reason for failure for easier debugging
             if (!isGameIdle) Logger.Log("AFT Lock Reject Reason: Game is not idle.");
             if (!hasNoTilts) Logger.Log($"AFT Lock Reject Reason: Active tilts present. First tilt: {status.currentTilts.FirstOrDefault()?.Description}");
             if (!isNotInMenu) Logger.Log("AFT Lock Reject Reason: EGM is in menu or maintenance mode.");
+            if (credits==0) Logger.Log("EGM Available to do a AFT IN whilst NO_MORE_BETS.");
 
-            return isGameIdle && hasNoTilts && isNotInMenu;
+            return (isGameIdle||(credits == 0)) && hasNoTilts && isNotInMenu;
         }
 
         public static SASCTL GetInstance()

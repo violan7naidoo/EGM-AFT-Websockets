@@ -239,6 +239,7 @@ namespace EGMENGINE
             SpinMarshall sm = new SpinMarshall();
             sm.slotplay = new SlotPlay();
             sm.slotplay.Finished = false;
+            //Logger.Log($"EGMPlaySpin:Is finished : {sm.slotplay.Finished}");
             sm.slotplay.exceededCredits = 0m;
             sm.slotplay.creditsBefore = EGMStatus.GetInstance().currentAmount;
             sm.slotplay.creditValue = EGMStatus.GetInstance().selectedCreditValue;
