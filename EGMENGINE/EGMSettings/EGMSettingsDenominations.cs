@@ -20,7 +20,7 @@ namespace EGMENGINE.EGMSettingsModule
         {
             denominations = new List<Denomination>
             {
-                new Denomination { Code = 0x01, monetaryValue = 0.01M, enabled = false },
+                new Denomination { Code = 0x01, monetaryValue = 0.01M, enabled = true },
 
                 new Denomination { Code = 0x02, monetaryValue = 0.05M, enabled = false },
 
@@ -28,7 +28,7 @@ namespace EGMENGINE.EGMSettingsModule
                 new Denomination { Code = 0x04, monetaryValue = 0.25M, enabled = false },
 
                 new Denomination { Code = 0x05, monetaryValue = 0.50M, enabled = false },
-                new Denomination { Code = 0x06, monetaryValue = 1.00M, enabled = true },
+                new Denomination { Code = 0x06, monetaryValue = 1.00M, enabled = false },
                 new Denomination { Code = 0x07, monetaryValue = 5.00M, enabled = false },
                 new Denomination { Code = 0x08, monetaryValue = 10.00M, enabled = false },
 
@@ -36,7 +36,7 @@ namespace EGMENGINE.EGMSettingsModule
                 new Denomination { Code = 0x09, monetaryValue = 20.00M, enabled = false },
 
                 new Denomination { Code = 0x0A, monetaryValue = 100.00M, enabled = false },
-                new Denomination { Code = 0x0B, monetaryValue = 0.20M, enabled = true },
+                new Denomination { Code = 0x0B, monetaryValue = 0.20M, enabled = false },
 
                 new Denomination { Code = 0x0C, monetaryValue = 2.00M, enabled = false },
 
@@ -63,7 +63,7 @@ namespace EGMENGINE.EGMSettingsModule
 
                 new Denomination { Code = 0x19, monetaryValue = 0.15M, enabled = false },
 
-                new Denomination { Code = 0x1A, monetaryValue = 0.40M, enabled = true },
+                new Denomination { Code = 0x1A, monetaryValue = 0.40M, enabled = false },
 
                 new Denomination { Code = 0x1B, monetaryValue = 0.005M, enabled = false },
 
@@ -73,7 +73,7 @@ namespace EGMENGINE.EGMSettingsModule
 
                 new Denomination { Code = 0x1E, monetaryValue = 0.001M, enabled = false },
                 new Denomination { Code = 0x1E, monetaryValue = 0.0005M, enabled = false },
-                new Denomination { Code = 0x1F, monetaryValue = 0.60M, enabled = true }
+                new Denomination { Code = 0x1F, monetaryValue = 0.60M, enabled = false }
 
             };
 

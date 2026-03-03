@@ -46,6 +46,30 @@ using System.Diagnostics;
 
 namespace EGMENGINE
 {
+    public static class EngineThread
+    {
+        public static SynchronizationContext? Context { get; private set; }
+
+        public static void Init()
+        {
+            Context = SynchronizationContext.Current
+                      ?? throw new InvalidOperationException("No SynchronizationContext on engine thread.");
+        }
+
+        public static Task RunAsync(Func<Task> action)
+        {
+            var ctx = Context ?? throw new InvalidOperationException("EngineThread not initialized");
+            var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            ctx.Post(async _ =>
+            {
+                try { await action(); tcs.SetResult(null); }
+                catch (Exception ex) { tcs.SetException(ex); }
+            }, null);
+
+            return tcs.Task;
+        }
+    }
     public static class Logger
     {
         private static readonly string logFilePath;
@@ -269,6 +293,7 @@ namespace EGMENGINE
         /// </summary>
         protected EGM()
         {
+            EngineThread.Init();
             // Check if it is Unity development
             if (File.Exists("Assets/EGMEngine.dll"))
             {
@@ -527,15 +552,38 @@ namespace EGMENGINE
             SASCTL.GetInstance().SetRoundHasUnsettledBet(value); // <<< THIS is the missing link
         }
 
-        private readonly SemaphoreSlim _spinGate = new SemaphoreSlim(1, 1);
+        //private readonly SemaphoreSlim _spinGate = new SemaphoreSlim(1, 1);
+        private static readonly SemaphoreSlim _spinGate = new SemaphoreSlim(1, 1);
 
-        private async Task RunSpinSingleFlightAsync(int betAmount, int winAmount)
+
+
+
+        private async Task RunSpinSingleFlightAsync(int betAmountCents, int winAmountCents)
         {
             await _spinGate.WaitAsync();
             try
             {
                 Logger.Log("Processing engine spin (single-flight)...");
-                await TriggerSpinFromWebSocket(betAmount, winAmount);
+
+                // Ensure ALL engine interactions happen on the engine thread
+                await EngineThread.RunAsync(() =>
+                {
+                    TriggerSpinFromWebSocket(betAmountCents, winAmountCents);
+                    return Task.CompletedTask;
+                });
+
+                // ✅ Spin is complete now (as far as your TriggerSpinFromWebSocket is concerned)
+                Logger.Log("Spin complete. Now finalizing settlement.");
+
+                // ✅ Settlement / AFT unlock stuff belongs here (not slotplay.Finished)
+                FlushQueuedCashouts();
+                billAcc.EnableBillAcceptor();
+                SASCTL.GetInstance().AcceptTransfer(true, true);
+
+                // If you're using settlement gating, clear it here (ONLY if your flow requires it):
+                SASCTL.GetInstance().SetSettlementPending(false);
+                StopSettlementTimeout();
+                SetRoundHasUnsettledBet(false);
             }
             catch (Exception ex)
             {
@@ -555,74 +603,76 @@ namespace EGMENGINE
                 if (data["event"]?.ToString() == "ui_ping" || data["event"]?.ToString() == "ui_pong")
                     return;
 
-                var spinConfig_aftlocks = GameGUIController.GetInstance().GUI_GetLastPlay();
+                
                 Logger.Log($"Processing WebSocket message: {message}");
                 Logger.Log($"CURRENT DISABLED BY HOST STATUS  ====================: {EGMStatus.GetInstance().disabledByHost}");
 
                 // Handle GAME_UPDATE - Trigger spin directly in engine
-                if (data["EventType"]?.ToString() == "GAME_UPDATE" && data["BetAmount"] != null &&     data["WinAmount"] != null)
+                if (data["EventType"]?.ToString() == "GAME_UPDATE" &&
+    data["BetAmount"] != null &&
+    data["WinAmount"] != null)
                 {
-                    int betAmount = data["BetAmount"].Value<int>();
-                    int winAmount = data["WinAmount"].Value<int>();
+                    // ------------------------------------------------------------------
+                    // 1️⃣ Extract values (these arrive in CREDITS from WebSocket)
+                    // ------------------------------------------------------------------
+                    int betAmountCredits = data["BetAmount"].Value<int>();
+                    int winAmountCredits = data["WinAmount"].Value<int>();
 
-                    Logger.Log($"GAME_UPDATE received - Bet: {betAmount}, Win: {winAmount}");
+                    // ------------------------------------------------------------------
+                    // 2️⃣ Convert credits → cents (ENGINE EXPECTS CENTS)
+                    // ------------------------------------------------------------------
+                    int betAmountCents = betAmountCredits * 1;
+                    int winAmountCents = winAmountCredits * 1;
 
-                    // Only spin if there is a bet
-                    if (betAmount > 0)
+                    Logger.Log($"GAME_UPDATE received - Bet: {betAmountCredits} credits ({betAmountCents}c), " +
+                               $"Win: {winAmountCredits} credits ({winAmountCents}c)");
+
+                    // ------------------------------------------------------------------
+                    // 3️⃣ If bet exists → run spin sequentially
+                    // ------------------------------------------------------------------
+                    if (betAmountCents > 0)
                     {
                         // Do NOT block message loop.
-                        // Run sequentially (no overlap) via the semaphore gate.
-                        _ = RunSpinSingleFlightAsync(betAmount, winAmount);
+                        // Spin execution + settlement finalization handled inside method.
+                        _ = RunSpinSingleFlightAsync(betAmountCents, winAmountCents);
                     }
                     else
                     {
+                        // ------------------------------------------------------------------
+                        // 4️⃣ No bet placed → no spin required
+                        // ------------------------------------------------------------------
                         Logger.Log("No bet placed - skipping spin.");
+
+                        
+
+                        FlushQueuedCashouts();
+
+                        billAcc.EnableBillAcceptor();
+                        SASCTL.GetInstance().AcceptTransfer(true, true);
                     }
-
-                    spinConfig_aftlocks.slotplay.Finished = true;
-
-                    // ---------------------------------------------------
-                    // 3️⃣ Now credits are correct → complete deferred LP72
-                    // ---------------------------------------------------
-                    FlushQueuedCashouts();
-
-                    // ---------------------------------------------------
-                    // 4️⃣ Allow transfers again
-                    // ---------------------------------------------------
-                    billAcc.EnableBillAcceptor();
-                    SASCTL.GetInstance().AcceptTransfer(true, true);
                 }
                 else if (data["EventType"]?.ToString() == "NO_MORE_BETS")
                 {
-                    int betAmount = data["BetValue"] != null
-                        ? data["BetValue"].Value<int>()
-                        : 0;
+                    int betValueCents = data["BetValue"] != null ? data["BetValue"].Value<int>() : 0;
+                    Logger.Log($"NO_MORE_BETS received. BetValueCents={betValueCents}");
 
-                    Logger.Log($"NO_MORE_BETS received. BetAmount={betAmount}");
+                    bool hasUnsettledBet = betValueCents > 0;
 
-                    bool hasUnsettledBet = betAmount > 0;
-
-                    // ✅ IMPORTANT: use setter (this bridges into SASCTL)
+                    // This flag is for AFT lock decisions only (NOT engine spin state)
                     SetRoundHasUnsettledBet(hasUnsettledBet);
 
                     if (hasUnsettledBet)
                     {
-                        // Only block if a bet was actually placed
                         SASCTL.GetInstance().SetSettlementPending(true);
                         StartSettlementTimeout();
-
-                        spinConfig_aftlocks.slotplay.Finished = false;
 
                         billAcc.DisableBillAcceptor();
                         SASCTL.GetInstance().RejectTransfer(true, true);
                     }
                     else
                     {
-                        // No bet placed → allow cashout normally
                         SASCTL.GetInstance().SetSettlementPending(false);
                         StopSettlementTimeout();
-
-                        spinConfig_aftlocks.slotplay.Finished = true;
 
                         billAcc.EnableBillAcceptor();
                         SASCTL.GetInstance().AcceptTransfer(true, true);
@@ -671,98 +721,81 @@ namespace EGMENGINE
         private bool _isProcessingSpin = false;
         public event Action<decimal> CreditsUpdated;
         //public event Action<decimal> CreditsUpdated;
-        private async Task TriggerSpinFromWebSocket(int betAmount, int winAmount)
+        private void TriggerSpinFromWebSocket(int betAmount, int winAmount)
         {
-            lock (_spinLock)
+            try
             {
-                if (_isProcessingSpin)
+                Logger.Log($"Starting WebSocket spin process - Bet: {betAmount}, Win: {winAmount}");
+
+                var frontendStatus = EGMStatus.GetInstance().frontend_play.thisstatus;
+
+                if (frontendStatus != FrontEndPlayStatus.Playable)
                 {
-                    Logger.Log("Spin already in progress, ignoring duplicate request");
-                    return;
-                }
+                    Logger.Log($"Cannot spin - wrong state: {frontendStatus}");
 
-                _isProcessingSpin = true;
-
-                try
-                {
-                    Logger.Log($"Starting WebSocket spin process - Bet: {betAmount}, Win: {winAmount}");
-
-
-                    if (EGMStatus.GetInstance().frontend_play.thisstatus != FrontEndPlayStatus.Playable)
+                    if (frontendStatus == FrontEndPlayStatus.WinningState)
                     {
-                        Logger.Log($"Cannot spin - wrong state: {EGMStatus.GetInstance().frontend_play.thisstatus}");
-                        if (EGMStatus.GetInstance().frontend_play.thisstatus == FrontEndPlayStatus.WinningState)
+                        Logger.Log("Recovering from WinningState...");
+                        GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.WinAnimationFinished);
+                        Thread.Sleep(100);
+
+                        if (EGMStatus.GetInstance().frontend_play.thisstatus != FrontEndPlayStatus.Playable)
                         {
-                            Logger.Log("Attempting to recover from stuck WinningState...");
-                            GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.WinAnimationFinished);
-                            Thread.Sleep(100);
-                            if (EGMStatus.GetInstance().frontend_play.thisstatus != FrontEndPlayStatus.Playable)
-                            {
-                                Logger.Log("Recovery failed, state is still not Playable.");
-                                _isProcessingSpin = false;
-                                return;
-                            }
-                            Logger.Log("Recovery successful, state is now Playable. Proceeding with spin.");
-                        }
-                        else
-                        {
-                            _isProcessingSpin = false;
+                            Logger.Log("Recovery failed. Aborting spin.");
                             return;
                         }
                     }
-                    // =========================================================================
-
-                    decimal creditsBefore = EGM_GetCurrentCredits();
-                    Logger.Log($"Credits before spin: {creditsBefore}");
-
-                    Logger.Log("Calling GUI_SpinButtonPressed...");
-                    var spinConfig = GameGUIController.GetInstance().GUI_SpinButtonPressed(winAmount, betAmount);
-                    var currentState = GameGUIController.GetInstance().GUI_get_FrontEndPlayStatus();
-                    Logger.Log($"State after GUI_SpinButtonPressed: {currentState}");
-
-                    Logger.Log("Triggering ReelsSpinning animation...");
-                    GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.ReelsSpinning);
-                    Thread.Sleep(500);
-
-                    Logger.Log("Triggering ReelsStoped animation...");
-                    GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.ReelsStoped);
-
-
-                    //prevents the state from getting stuck after a win.
-                    if (winAmount > 0)
+                    else
                     {
-                        Thread.Sleep(200);
-                        Logger.Log($"Win detected ({winAmount}). Triggering WinAnimationFinished to return to Playable state.");
-                        GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.WinAnimationFinished);
+                        return;
                     }
-                    // ===============================================================================
-
-                    spinConfig = GameGUIController.GetInstance().GUI_GetLastPlay();
-                    Logger.Log($"Last play retrieved - CreditsBefore: {spinConfig.slotplay.creditsBefore}, CreditsOnPlay: {spinConfig.slotplay.creditsOnPlay}");
-
-                    decimal currentCredits = EGM_GetCurrentCredits();
-                    Logger.Log($"Credits after spin: {currentCredits}");
-                    CreditsUpdated?.Invoke(currentCredits);
-
-                    currentState = GameGUIController.GetInstance().GUI_get_FrontEndPlayStatus();
-                    Logger.Log($"Final state after processing: {currentState}");
-
-                    Logger.Log("Waiting for spin completion...");
-                    Thread.Sleep(10000);
-
-                    //SendSpinCompletionMessage(betAmount, winAmount, currentCredits);
-                    Logger.Log("EGM Spin completed successfully.");
                 }
-                catch (Exception ex)
+
+                decimal creditsBefore = EGM_GetCurrentCredits();
+                Logger.Log($"Credits before spin: {creditsBefore}");
+
+                Logger.Log($"SettlementPending: {_settlementPending}");
+                Logger.Log($"RoundHasUnsettledBet: {_roundHasUnsettledBet}");
+                Logger.Log($"FrontEndState: {GameGUIController.GetInstance().GUI_get_FrontEndPlayStatus()}");
+                Logger.Log($"acceptPlayRequest: {GameGUIController.GetInstance().acceptPlayRequest}");
+                // 🔹 Single call only
+                var spinConfig = GameGUIController.GetInstance()
+                                                  .GUI_SpinButtonPressed( betAmount, winAmount);
+
+                Logger.Log($"State after GUI_SpinButtonPressed: {GameGUIController.GetInstance().GUI_get_FrontEndPlayStatus()}");
+
+                // --- Simulate reel lifecycle ---
+                GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.ReelsSpinning);
+                Thread.Sleep(500);
+
+                GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.ReelsStoped);
+
+                if (winAmount > 0)
                 {
-                    Logger.Log($"WebSocket spin failed: {ex.Message}");
-                    EGMStatus.GetInstance().frontend_play.Transition(FrontEndPlayStatus.Playable);
-                    EGMStatus.GetInstance().spinstatus.Transition(SpinRepresentationStatus.Idle);
+                    Thread.Sleep(200);
+                    GameGUIController.GetInstance().AnimationStatusUpdate(AnimationEvent.WinAnimationFinished);
                 }
-                finally
+
+                // --- Inspect spin result ---
+                if (spinConfig != null)
                 {
-                    _isProcessingSpin = false;
+                    Logger.Log($"Last play - CreditsBefore: {spinConfig.slotplay.creditsBefore}, " +
+                               $"CreditsOnPlay: {spinConfig.slotplay.creditsOnPlay}");
                 }
+
+                decimal creditsAfter = EGM_GetCurrentCredits();
+                Logger.Log($"Credits after spin: {creditsAfter}");
+
+                CreditsUpdated?.Invoke(creditsAfter);
+
+                Logger.Log($"Final state: {GameGUIController.GetInstance().GUI_get_FrontEndPlayStatus()}");
+                Logger.Log("EGM Spin completed successfully.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"WebSocket spin failed: {ex}");
+                EGMStatus.GetInstance().frontend_play.Transition(FrontEndPlayStatus.Playable);
+                EGMStatus.GetInstance().spinstatus.Transition(SpinRepresentationStatus.Idle);
             }
         }
         private void SendSpinCompletionMessage(int betAmount, int winAmount, decimal currentCredits)

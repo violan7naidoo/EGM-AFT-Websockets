@@ -218,17 +218,24 @@ namespace EGMENGINE
         /// It is used by GameGUIController to serve to the GUI consumer a way to create, start and finish a Slot Play with the respective information like paylines or reel stops
         /// </summary>
         /// <returns>A SpinMarshall object</returns>
-        internal SpinMarshall Game_SlotCreatePlay(int winAmountcents, int betAmountcents)
+        internal SpinMarshall Game_SlotCreatePlay(int betAmountcents, int winAmountcents)
         {
+            Logger.Log($"[Game_SlotCreatePlay] ENTER bet={betAmountcents} win={winAmountcents}");
+
+            var status = EGMStatus.GetInstance();
+            Logger.Log($"[Game_SlotCreatePlay] State: frontend={status.frontend_play.thisstatus}, disabledByHost={status.disabledByHost}, currentAmount={status.currentAmount}");
+
             persiststatus = true;
             if (EGMStatus.GetInstance().current_play.spin != null && !EGMStatus.GetInstance().current_play.spin.slotplay.Finished)
             {
+                Logger.Log("EGMStatus.GetInstance().current_play.spin != null && !EGMStatus.GetInstance().current_play.spin.slotplay.Finished");
                 return EGMStatus.GetInstance().current_play.spin;
             }
             BaseSpin spin = null;
             if (EGMStatus.GetInstance().current_play.actionGameIndex > -1 && EGMStatus.GetInstance().current_play.actionGameIndex < EGMStatus.GetInstance().current_play.getActionGames().Count())
             {
                 ActionGame g = EGMStatus.GetInstance().current_play.getActionGames()[EGMStatus.GetInstance().current_play.actionGameIndex];
+                Logger.Log("EGMStatus.GetInstance().current_play.actionGameIndex > -1 && EGMStatus.GetInstance().current_play.actionGameIndex < EGMStatus.GetInstance().current_play.getActionGames().Count()");
                 return ActionGame_SlotCreatePlay(g);
             }
             if (EGMStatus.GetInstance().current_play.pennyGamesIndex > -1 && EGMStatus.GetInstance().current_play.pennyGamesIndex < EGMStatus.GetInstance().current_play.getPennyGames().Count())
@@ -307,6 +314,7 @@ namespace EGMENGINE
                     EGMStatus.GetInstance().current_play.baseWinning = false;
                     sm.slotplay.creditsAfter = EGMStatus.GetInstance().currentAmount + _TotalBetAmount_ + _TotalBaseWin_;
                     sm.slotplay.winCredits = _TotalBaseWin_;
+                    Logger.Log("_TotalBaseWin_ >= EGMSettings.GetInstance().jackpotLimit");
                     return FinishPlay(sm, spin);
                 }
                 jackpot_amount = default(decimal);
@@ -316,11 +324,13 @@ namespace EGMENGINE
                 sm.slotplay.creditsAfterExpandedWin = sm.slotplay.creditsAfterScatterWin;
                 sm.slotplay.winCredits = _TotalBaseWin_;
                 sm.slotplay.creditsAfter = EGMStatus.GetInstance().currentAmount + _TotalBetAmount_ + _TotalBaseWin_;
+                Logger.Log("not - _TotalBaseWin_ >= EGMSettings.GetInstance().jackpotLimit");
                 return FinishPlay(sm, spin);
             }
             sm.slotplay.winCredits = _TotalBaseWin_;
             sm.slotplay.exceededCredits = EGMStatus.GetInstance().currentAmount + _TotalBetAmount_ + _TotalBaseWin_ - EGMSettings.GetInstance().creditLimit;
             sm.slotplay.creditsAfter = EGMSettings.GetInstance().creditLimit;
+            Logger.Log($"[Game_SlotCreatePlay] EXIT creditsBefore={sm?.slotplay?.creditsBefore} creditsOnPlay={sm?.slotplay?.creditsOnPlay} finished={sm?.slotplay?.Finished}");
             return FinishPlay(sm, spin);
 
         }

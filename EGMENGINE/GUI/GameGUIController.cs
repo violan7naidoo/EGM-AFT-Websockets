@@ -36,11 +36,12 @@ namespace EGMENGINE.GUI
             EGM.GetInstance();
         }
 
-        public SpinMarshall GUI_SpinButtonPressed(int winAmountcents, int betAmountcents)
+        public SpinMarshall GUI_SpinButtonPressed(int betAmountcents, int winAmountcents)
         {
+            Logger.Log($"[GUI_SpinButtonPressed] betCents={betAmountcents} winCents={winAmountcents} acceptPlayRequest={acceptPlayRequest}");
             if (acceptPlayRequest)
             {
-                return EGM.GetInstance().Game_SlotCreatePlay(winAmountcents, betAmountcents);
+                return EGM.GetInstance().Game_SlotCreatePlay(betAmountcents, winAmountcents);
             }
             else
             {

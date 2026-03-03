@@ -776,6 +776,8 @@ namespace EGMENGINE.SASCTLModule
         GameIsOutOfServiceByAttendant = 0x86
 
     }
+
+
     internal class SASCTL
     {
         private readonly object _lp72DeferredLock = new object();
@@ -783,6 +785,8 @@ namespace EGMENGINE.SASCTLModule
 
         // You already have this in EGM; you must bridge it here or reference it.
         private bool _settlementPending = false;
+
+
 
         private sealed class DeferredLP72Cashout
         {
@@ -839,6 +843,49 @@ namespace EGMENGINE.SASCTLModule
         internal SASTiltNoDetectedHandler SASNoTiltDetected;
 
         private ulong g_qwCurrTotalCredit;
+
+        // ================================
+        // SAFE NUMERIC CONVERSION HELPERS
+        // ================================
+
+        private static ulong ToUlongCreditsSafe(decimal? amount, decimal denom, string name)
+        {
+            if (!amount.HasValue) return 0UL;
+
+            if (denom <= 0m)
+            {
+                Logger.Log($"[SASCTL][WARN] Denomination invalid ({denom}) while converting {name}. Returning 0.");
+                return 0UL;
+            }
+
+            decimal credits = amount.Value / denom;
+
+            // Remove fractional part
+            credits = decimal.Truncate(credits);
+
+            if (credits < 0m)
+            {
+                Logger.Log($"[SASCTL][WARN] {name} became NEGATIVE after denom conversion: {credits}. Clamping to 0.");
+                return 0UL;
+            }
+
+            const decimal U64_MAX = 18446744073709551615m;
+
+            if (credits > U64_MAX)
+            {
+                Logger.Log($"[SASCTL][WARN] {name} too large after denom conversion: {credits}. Clamping to UInt64.MaxValue.");
+                return ulong.MaxValue;
+            }
+
+            return (ulong)credits;
+        }
+
+        private static ulong AddUlongSaturating(ulong a, ulong b)
+        {
+            ulong r = a + b;
+            if (r < a) return ulong.MaxValue;
+            return r;
+        }
         private ulong g_bCurrAFTStatus;
 
         protected SASCTL()
@@ -894,35 +941,68 @@ namespace EGMENGINE.SASCTLModule
             CreditLimitExceeded = false;
         }
 
-        public void UpdateSASInfo(decimal? reportedDenom, decimal? creditLimit, decimal? cashCredit, decimal? restCredit, decimal? nonRestCredit, decimal? _inHouseInLimit, decimal? _inHouseOutLimit)
+        public void UpdateSASInfo(
+    decimal? reportedDenom,
+    decimal? creditLimit,
+    decimal? cashCredit,
+    decimal? restCredit,
+    decimal? nonRestCredit,
+    decimal? _inHouseInLimit,
+    decimal? _inHouseOutLimit)
         {
-            if (reportedDenom != null)
-                sasReportedDenomination = reportedDenom.Value;
-            if (cashCredit != null)
-                sasCashCredit = (ulong)(cashCredit.Value / sasReportedDenomination);
-            if (restCredit != null)
-                sasRestCredit = (ulong)(restCredit.Value / sasReportedDenomination);
-            if (nonRestCredit != null)
-                sasNonRestCredit = (ulong)(nonRestCredit.Value / sasReportedDenomination);
-            if (creditLimit != null)
-                sasCreditLimit = (ulong)(creditLimit.Value / sasReportedDenomination);
-            if (_inHouseInLimit != null)
+            // Update denomination safely
+            if (reportedDenom.HasValue)
             {
-                if (_inHouseInLimit == 0)
+                if (reportedDenom.Value > 0m)
+                {
+                    sasReportedDenomination = reportedDenom.Value;
+                }
+                else
+                {
+                    Logger.Log($"[SASCTL][WARN] Invalid reportedDenom: {reportedDenom.Value}");
+                }
+            }
+
+            if (sasReportedDenomination <= 0m)
+            {
+                Logger.Log("[SASCTL][ERROR] Denomination is invalid. Skipping UpdateSASInfo.");
+                return;
+            }
+
+            // Convert all credit values safely
+            if (cashCredit.HasValue)
+                sasCashCredit = ToUlongCreditsSafe(cashCredit, sasReportedDenomination, "cashCredit");
+
+            if (restCredit.HasValue)
+                sasRestCredit = ToUlongCreditsSafe(restCredit, sasReportedDenomination, "restCredit");
+
+            if (nonRestCredit.HasValue)
+                sasNonRestCredit = ToUlongCreditsSafe(nonRestCredit, sasReportedDenomination, "nonRestCredit");
+
+            if (creditLimit.HasValue)
+                sasCreditLimit = ToUlongCreditsSafe(creditLimit, sasReportedDenomination, "creditLimit");
+
+            if (_inHouseInLimit.HasValue)
+            {
+                if (_inHouseInLimit.Value == 0m)
                     inHouseInLimit = ulong.MaxValue;
                 else
-                    inHouseInLimit = (ulong)(_inHouseInLimit.Value / sasReportedDenomination);
+                    inHouseInLimit = ToUlongCreditsSafe(_inHouseInLimit, sasReportedDenomination, "_inHouseInLimit");
             }
-            if (_inHouseOutLimit != null)
+
+            if (_inHouseOutLimit.HasValue)
             {
-                if (_inHouseOutLimit == 0)
+                if (_inHouseOutLimit.Value == 0m)
                     inHouseOutLimit = ulong.MaxValue;
                 else
-                    inHouseOutLimit = (ulong)(_inHouseOutLimit.Value / sasReportedDenomination);
+                    inHouseOutLimit = ToUlongCreditsSafe(_inHouseOutLimit, sasReportedDenomination, "_inHouseOutLimit");
             }
-            if (creditLimit != null)
-                sasCreditLimit = (ulong)(creditLimit.Value / sasReportedDenomination);
-            g_qwCurrTotalCredit = sasCashCredit + sasRestCredit + sasNonRestCredit;
+
+            // Safe total calculation
+            g_qwCurrTotalCredit = 0UL;
+            g_qwCurrTotalCredit = AddUlongSaturating(g_qwCurrTotalCredit, sasCashCredit);
+            g_qwCurrTotalCredit = AddUlongSaturating(g_qwCurrTotalCredit, sasRestCredit);
+            g_qwCurrTotalCredit = AddUlongSaturating(g_qwCurrTotalCredit, sasNonRestCredit);
         }
 
         public void Init(decimal reportedDenom, decimal creditLimit, decimal cashCredit, decimal restCredit, decimal nonRestCredit, decimal inHouseInLimit, decimal inHouseOutLimit, bool enableSAS)
