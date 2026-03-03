@@ -490,18 +490,35 @@ namespace EGMENGINE
 
             if (webSocket?.IsAlive == true)
             {
+
+                string egmId = "EGM-0441";
+                //long seq = NextSeq();
                 decimal credits = EGM_GetCurrentCredits();
-                var message = new
+                ulong ws_credits = (ulong)(credits * 100);
+
+                var sessionEvent = new
                 {
-                    eventType = "session_initialized",
-                    client = "EGM_Application",
-                    timestamp = DateTime.UtcNow,
-                    payload = new { availableCredits = credits }
+                    @event = "session_initialized",
+                    egmId,                    
+                    sentAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                    nonce = Guid.NewGuid().ToString(),
+                    payload = new
+                    {
+                        egmId,
+                        jurisdiction = "NV",
+                        currency = "ZAR",
+                        availableCredits = (ulong)(ws_credits),
+                        aftAccountId = "AFT-12345",
+                        playerClass = "VIP",
+                        version = new { egmBackend = "1.0.0", sasDaemon = "2.1.0" }
+                    }
                 };
 
-                SendToWebSocket(message);
+                Logger.Log($"[SESSION] Broadcast session_initialized -> roulette (credits={ws_credits})");
+
+                SendToWebSocket(sessionEvent);
                 _sessionInitializedSent = true;
-                Logger.Log($"session_initialized sent once (availableCredits: {credits}). Will not send again until engine restarts.");
+                Logger.Log($"session_initialized sent once (availableCredits: {ws_credits}). Will not send again until engine restarts.");
             }
             else
             {
@@ -678,15 +695,7 @@ namespace EGMENGINE
                         SASCTL.GetInstance().AcceptTransfer(true, true);
                     }
                 }
-                else if (data["EventType"]?.ToString() == "CREDIT_UPDATE")
-                {
-                    // Handle credit updates if needed
-                    if (data["CurrentCredits"] != null)
-                    {
-                        decimal credits = data["CurrentCredits"].Value<decimal>();
-                        Logger.Log($"Credit update received: {credits}");
-                    }
-                }
+                
                 else if (data["EventType"]?.ToString() == "AFT_CONFIRMED")
                 {
                     Logger.Log("Received AFT_CONFIRMED - Processing transfer confirmation");
@@ -1107,12 +1116,17 @@ namespace EGMENGINE
             // Suscribes the event SASGameDisabled
             SASCTLModule.SASCTL.GetInstance().SASGameDisabled += new SASGameDisabledHandler((e) =>
             {
-                // Update the disabledByHost
-                EGMStatus.GetInstance().disabledByHost = true;
-                Logger.Log($"SAS GAME :  DISABLED SIGNAL");
-                Logger.Log($"GAME FRONTEND PLAY STATUS: {EGMStatus.GetInstance().frontend_play.thisstatus}");
-                // Cash In GM Lock Cnt
-                SASCTL.GetInstance().RejectTransfer(true, true);
+                //if (!_settlementPending)
+                {
+                    // Update the disabledByHost
+                    EGMStatus.GetInstance().disabledByHost = true;
+                    Logger.Log($"SAS GAME :  DISABLED SIGNAL");
+                    Logger.Log($"SASGameDisabled-GAME FRONTEND PLAY STATUS: {EGMStatus.GetInstance().frontend_play.thisstatus}");
+                    // Cash In GM Lock Cnt
+                    SASCTL.GetInstance().RejectTransfer(true, true);
+                }
+                
+                
 
 
             });
@@ -1120,12 +1134,16 @@ namespace EGMENGINE
             SASCTL.GetInstance().SASGameEnabled += new SASGameEnabledHandler((e) =>
             {
                 // Update the disabledByHost
-                EGMStatus.GetInstance().disabledByHost = false;
-                Logger.Log($"SAS GAME :  ENABLED SIGNAL");
-                Logger.Log($"GAME FRONTEND PLAY STATUS: {EGMStatus.GetInstance().frontend_play.thisstatus}");
-                // Cash In GM Lock Cnt
+                
+                    EGMStatus.GetInstance().disabledByHost = false;
+                    Logger.Log($"SAS GAME :  ENABLED SIGNAL");
+                    Logger.Log($"SASGameEnabled-GAME FRONTEND PLAY STATUS: {EGMStatus.GetInstance().frontend_play.thisstatus}");
+                    // Cash In GM Lock Cnt
 
-                SASCTL.GetInstance().AcceptTransfer(true, true);
+                    SASCTL.GetInstance().AcceptTransfer(true, true);
+                
+               
+                
 
 
             });
@@ -1332,9 +1350,11 @@ namespace EGMENGINE
 
                 decimal totalAmount = c + r + nr;
                 decimal futureCredits = EGM_GetCurrentCredits();
+                //ulong ws_totalAmount = (ulong)(totalAmount * 100);
+                //ulong ws_futureCredits = (ulong)(futureCredits * 100);
 
                 SendAFTWebSocket(
-                    Math.Abs(totalAmount),
+                    (totalAmount),
                     isCashout,
                     futureCredits,
                     dc.ToString()
@@ -1844,8 +1864,8 @@ namespace EGMENGINE
             var message = new
             {
                 EventType = "BILL_INSERTED",
-                amount = amount,
-                CurrentCredits = credits,
+                amount = (ulong)(amount*100),
+                CurrentCredits = (ulong)(credits*100),
                 timestamp = DateTime.UtcNow,
                 currency = "ZAR"
             };
@@ -1855,11 +1875,12 @@ namespace EGMENGINE
         }
         private void SendAFTWebSocket(decimal amount, bool isCashout, decimal currentCredits, string reference = "")
         {
+           
             var message = new
             {
                 EventType = isCashout ? "AFT_CASHOUT" : "AFT_DEPOSIT",
-                Amount = amount,
-                CurrentCredits = currentCredits,
+                Amount = (ulong)(amount*100),
+                CurrentCredits = (ulong)(currentCredits*100),
                 Timestamp = DateTime.UtcNow,
                 AFTReference = reference,
                 Currency = "ZAR"

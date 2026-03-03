@@ -1765,7 +1765,10 @@ namespace EGMENGINE.SASCTLModule
             // ✅ IMPORTANT: block lock while settlement is pending OR wager unsettled
             // (prevents UILock during a live wager)
             bool noUnsettledRound = !_settlementPending && !_roundHasUnsettledBet;
-
+            Logger.Log($"hasNoTilts{ hasNoTilts}");
+            Logger.Log($"isNotInMenu{ isNotInMenu}");
+            Logger.Log($"aftNotBusy{ aftNotBusy}");
+            Logger.Log($"noUnsettledRound{ noUnsettledRound}");
             return hasNoTilts && isNotInMenu && aftNotBusy && noUnsettledRound;
         }
 
